@@ -15,6 +15,7 @@
 #include "asm/charmap.h"
 #include "asm/main.h"
 #include "asm/output.h"
+#include "asm/refs.h"
 
 #include "extern/utf8decoder.h"
 
@@ -47,6 +48,8 @@ int32_t charmap_Add(char *input, uint8_t output)
 	char temp1o = 0, temp2o = 0;
 
 	struct Charmap *charmap;
+
+	refs_addcharmap();
 
 	if (pCurrentSection) {
 		if (pCurrentSection->charmap) {
@@ -109,6 +112,8 @@ int32_t charmap_Convert(char **input)
 	char outchar[CHARMAPLENGTH + 1];
 	char *buffer;
 	int32_t i, j, length;
+
+	refs_usecharmap();
 
 	if (pCurrentSection && pCurrentSection->charmap)
 		charmap = pCurrentSection->charmap;

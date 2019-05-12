@@ -21,6 +21,7 @@
 #include "asm/lexer.h"
 #include "asm/output.h"
 #include "asm/main.h"
+#include "asm/refs.h"
 
 #include "extern/err.h"
 
@@ -58,6 +59,13 @@ struct sOptionStackEntry {
 };
 
 struct sOptionStackEntry *pOptionStack;
+
+char *run_mode_strings[] = {
+	"assemble",
+	"unusedinc",
+	"usedinc",
+	"uuset",
+};
 
 void opt_SetCurrentOptions(struct sOptions *pOpt)
 {
@@ -284,11 +292,20 @@ void warning(const char *fmt, ...)
 	va_end(args);
 }
 
+static enum run_mode parse_run_mode(char *mode_string)
+{
+	for (enum run_mode mode = 0; mode < COUNT_RUN_MODE; mode++) {
+		if (strcmp(mode_string, run_mode_strings[mode]) == 0) return mode;
+	}
+
+	errx(1, "Invalid argument for option 'm'");
+}
+
 static void print_usage(void)
 {
 	printf(
 "usage: rgbasm [-EhLVvw] [-b chars] [-Dname[=value]] [-g chars] [-i path]\n"
-"              [-M dependfile] [-o outfile] [-p pad_value] file.asm\n");
+"              [-M dependfile] [-o outfile] [-p pad_value] [-m mode] file.asm\n");
 	exit(1);
 }
 
@@ -332,7 +349,7 @@ int main(int argc, char *argv[])
 
 	newopt = CurrentOptions;
 
-	while ((ch = getopt(argc, argv, "b:D:Eg:hi:LM:o:p:Vvw")) != -1) {
+	while ((ch = getopt(argc, argv, "b:D:Eg:hi:LM:o:p:Vvwm:")) != -1) {
 		switch (ch) {
 		case 'b':
 			if (strlen(optarg) == 2) {
@@ -395,6 +412,9 @@ int main(int argc, char *argv[])
 		case 'w':
 			newopt.warnings = false;
 			break;
+		case 'm':
+			newopt.mode = parse_run_mode(optarg);
+			break;
 		default:
 			print_usage();
 			/* NOTREACHED */
@@ -439,7 +459,7 @@ int main(int argc, char *argv[])
 	fstk_Init(tzMainfile);
 	opt_ParseDefines();
 
-	if (CurrentOptions.verbose)
+	if (CurrentOptions.mode == RUN_MODE_ASSEMBLE && CurrentOptions.verbose)
 		printf("Pass 1...\n");
 
 	yy_set_state(LEX_STATE_NORMAL);
@@ -471,7 +491,7 @@ int main(int argc, char *argv[])
 	opt_SetCurrentOptions(&DefaultOptions);
 	opt_ParseDefines();
 
-	if (CurrentOptions.verbose)
+	if (CurrentOptions.mode == RUN_MODE_ASSEMBLE && CurrentOptions.verbose)
 		printf("Pass 2...\n");
 
 	if (yyparse() != 0 || nErrors != 0)
@@ -482,7 +502,7 @@ int main(int argc, char *argv[])
 	nEndClock = clock();
 	timespent = ((double)(nEndClock - nStartClock))
 		     / (double)CLOCKS_PER_SEC;
-	if (CurrentOptions.verbose) {
+	if (CurrentOptions.mode == RUN_MODE_ASSEMBLE && CurrentOptions.verbose) {
 		printf("Success! %u lines in %d.%02d seconds ", nTotalLines,
 		       (int)timespent, ((int)(timespent * 100.0)) % 100);
 		if (timespent < FLT_MIN_EXP)
@@ -491,6 +511,17 @@ int main(int argc, char *argv[])
 			printf("(%d lines/minute)\n",
 			       (int)(60 / timespent * nTotalLines));
 	}
-	out_WriteObject();
+
+	switch (CurrentOptions.mode) {
+	case RUN_MODE_ASSEMBLE:
+		out_WriteObject();
+		return 0;
+	case RUN_MODE_USEDINC:
+		refs_writeusedfiles(tzMainfile);
+		return 0;
+	default:
+		break;
+	}
+
 	return 0;
 }

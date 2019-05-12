@@ -22,6 +22,7 @@
 #include "asm/main.h"
 #include "asm/mymath.h"
 #include "asm/output.h"
+#include "asm/refs.h"
 
 #include "extern/err.h"
 
@@ -83,6 +84,8 @@ int32_t Callback__LINE__(unused_ struct sSymbol *sym)
  */
 static int32_t getvaluefield(struct sSymbol *sym)
 {
+	refs_usesymbol(sym);
+
 	if (sym->Callback)
 		return sym->Callback(sym);
 
@@ -218,7 +221,7 @@ struct sSymbol *sym_FindSymbol(char *tzName)
 	else
 		pscope = NULL;
 
-	return findsymbol(tzName, pscope);
+	return refs_usesymbol(findsymbol(tzName, pscope));
 }
 
 /*
@@ -263,7 +266,7 @@ uint32_t sym_isConstDefined(char *tzName)
 	else
 		pscope = NULL;
 
-	psym = findsymbol(tzName, pscope);
+	psym = refs_usesymbol(findsymbol(tzName, pscope));
 
 	if (psym && (psym->nType & SYMF_DEFINED)) {
 		uint32_t mask = SYMF_EQU | SYMF_SET | SYMF_MACRO | SYMF_STRING;
@@ -541,7 +544,7 @@ void sym_UseCurrentMacroArgs(void)
  */
 struct sSymbol *sym_FindMacro(char *s)
 {
-	return findsymbol(s, NULL);
+	return refs_usesymbol(findsymbol(s, NULL));
 }
 
 /*

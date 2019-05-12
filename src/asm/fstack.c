@@ -326,7 +326,8 @@ uint32_t fstk_RunMacro(char *s)
 	nLineNo = -1;
 	sym_UseNewMacroArgs();
 	nCurrentStatus = STAT_isMacro;
-	strcpy(tzCurrentFileName, s);
+	if (CurrentOptions.mode != RUN_MODE_USEDINC)
+		strcpy(tzCurrentFileName, s);
 
 	if (sym->pMacro == NULL)
 		return 0;

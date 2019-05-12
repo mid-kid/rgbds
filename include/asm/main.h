@@ -14,6 +14,14 @@
 
 #include "helpers.h"
 
+enum run_mode {
+	RUN_MODE_ASSEMBLE,
+	RUN_MODE_UNUSEDINC,
+	RUN_MODE_USEDINC,
+	RUN_MODE_UUSET,
+	COUNT_RUN_MODE,
+};
+
 struct sOptions {
 	char binary[2];
 	char gbgfx[4];
@@ -23,6 +31,7 @@ struct sOptions {
 	bool optimizeloads;
 	bool verbose;
 	bool warnings; /* True to enable warnings, false to disable them. */
+	enum run_mode mode;
 };
 
 extern char *tzNewMacro;
