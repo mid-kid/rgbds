@@ -23,11 +23,13 @@ TODO
 
 ### `usedinc`
 
-Lists all (recursively) `INCLUDE`d files from a certain source file that are actually used, excluding files that aren't used.
+Lists all (recursively) `INCLUDE`d files from a certain source file that are actually used in the process of creating the resulting binary, excluding files that aren't.
 
 Used with the `-v` (verbose) option, this tool will output additional information about used symbols and what files are referenced through which used symbols to standard error.
 
-There's a huge caveat right now: If any charmap character is used, all files that use the `charmap` directive will be considered as used, even if the characters it defines are unused.
+Caveats:
+- Uses of symbols defined through `SET` or `=` won't cause a file to become "used", since they don't necessarily belong to a single file.
+- If any charmap character is used, all files that use the `charmap` directive will be considered as used, even if the characters it defines are unused.
 
 
 ### `uuset`
