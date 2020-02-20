@@ -1,1 +1,1 @@
-error: ROMX sections can't be used with option -t.
+error: Unable to place "r0a" (ROM0 section) anywhere

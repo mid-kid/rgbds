@@ -1,4 +1,4 @@
-SECTION "All instructions", ROM0
+SECTION "All instructions", ROM0[0]
 
     ; 8-bit Arithmetic and Logic Instructions
 
@@ -235,3 +235,8 @@ jrlabel:
     nop
     scf
     stop
+BYTE = 0
+REPT 256
+    stop BYTE
+BYTE = BYTE + 1
+ENDR

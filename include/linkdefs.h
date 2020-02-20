@@ -9,7 +9,14 @@
 #ifndef RGBDS_LINKDEFS_H
 #define RGBDS_LINKDEFS_H
 
-enum eRpnData {
+#include <stdbool.h>
+#include <stdint.h>
+
+#define RGBDS_OBJECT_VERSION_STRING "RGB%1hhu"
+#define RGBDS_OBJECT_VERSION_NUMBER (uint8_t)9
+#define RGBDS_OBJECT_REV 1
+
+enum RPNCommand {
 	RPN_ADD		= 0x00,
 	RPN_SUB		= 0x01,
 	RPN_MUL		= 0x02,
@@ -41,33 +48,90 @@ enum eRpnData {
 	RPN_BANK_SELF	= 0x52,
 
 	RPN_HRAM	= 0x60,
+	RPN_RST         = 0x61,
 
 	RPN_CONST	= 0x80,
 	RPN_SYM		= 0x81
 };
 
-enum eSectionType {
-	SECT_WRAM0	= 0x00,
-	SECT_VRAM	= 0x01,
-	SECT_ROMX	= 0x02,
-	SECT_ROM0	= 0x03,
-	SECT_HRAM	= 0x04,
-	SECT_WRAMX	= 0x05,
-	SECT_SRAM	= 0x06,
-	SECT_OAM	= 0x07
+enum SectionType {
+	SECTTYPE_WRAM0,
+	SECTTYPE_VRAM,
+	SECTTYPE_ROMX,
+	SECTTYPE_ROM0,
+	SECTTYPE_HRAM,
+	SECTTYPE_WRAMX,
+	SECTTYPE_SRAM,
+	SECTTYPE_OAM,
+
+	SECTTYPE_INVALID
 };
 
-enum eSymbolType {
-	SYM_LOCAL	= 0x00,
-	SYM_IMPORT	= 0x01,
-	SYM_EXPORT	= 0x02
+/**
+ * Tells whether a section has data in its object file definition,
+ * depending on type.
+ * @param type The section's type
+ * @return `true` if the section's definition includes data
+ */
+static inline bool sect_HasData(enum SectionType type)
+{
+	return type == SECTTYPE_ROM0 || type == SECTTYPE_ROMX;
+}
+
+enum ExportLevel {
+	SYMTYPE_LOCAL,
+	SYMTYPE_IMPORT,
+	SYMTYPE_EXPORT
 };
 
-enum ePatchType {
-	PATCH_BYTE	= 0x00,
-	PATCH_WORD_L	= 0x01,
-	PATCH_LONG_L	= 0x02,
-	PATCH_BYTE_JR	= 0x03
+enum PatchType {
+	PATCHTYPE_BYTE,
+	PATCHTYPE_WORD,
+	PATCHTYPE_LONG,
+	PATCHTYPE_JR,
+
+	PATCHTYPE_INVALID
 };
+
+#define BANK_MIN_ROM0  0
+#define BANK_MAX_ROM0  0
+#define BANK_MIN_ROMX  1
+#define BANK_MAX_ROMX  511
+#define BANK_MIN_VRAM  0
+#define BANK_MAX_VRAM  1
+#define BANK_MIN_SRAM  0
+#define BANK_MAX_SRAM  15
+#define BANK_MIN_WRAM0 0
+#define BANK_MAX_WRAM0 0
+#define BANK_MIN_WRAMX 1
+#define BANK_MAX_WRAMX 7
+#define BANK_MIN_OAM   0
+#define BANK_MAX_OAM   0
+#define BANK_MIN_HRAM  0
+#define BANK_MAX_HRAM  0
+
+extern uint16_t startaddr[];
+extern uint16_t maxsize[];
+extern uint32_t bankranges[][2];
+
+/**
+ * Computes a memory region's end address (last byte), eg. 0x7FFF
+ * @return The address of the last byte in that memory region
+ */
+static inline uint16_t endaddr(enum SectionType type)
+{
+	return startaddr[type] + maxsize[type] - 1;
+}
+
+/**
+ * Computes a memory region's number of banks
+ * @return The number of banks, 1 for regions without banking
+ */
+static inline uint32_t nbbanks(enum SectionType type)
+{
+	return bankranges[type][1] - bankranges[type][0] + 1;
+}
+
+extern char const * const typeNames[SECTTYPE_INVALID];
 
 #endif /* RGBDS_LINKDEFS_H */

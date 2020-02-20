@@ -11,18 +11,60 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "extern/err.h"
+#include "extern/getopt.h"
 
 #include "version.h"
 
+/* Short options */
+static char const *optstring = "Ccf:i:jk:l:m:n:p:r:st:Vv";
+
+/*
+ * Equivalent long options
+ * Please keep in the same order as short opts
+ *
+ * Also, make sure long opts don't create ambiguity:
+ * A long opt's name should start with the same letter as its short opt,
+ * except if it doesn't create any ambiguity (`verbose` versus `version`).
+ * This is because long opt matching, even to a single char, is prioritized
+ * over short opt matching
+ */
+static struct option const longopts[] = {
+	{ "color-only",       no_argument,       NULL, 'C' },
+	{ "color-compatible", no_argument,       NULL, 'c' },
+	{ "fix-spec",         required_argument, NULL, 'f' },
+	{ "game-id",          required_argument, NULL, 'i' },
+	{ "non-japanese",     no_argument,       NULL, 'j' },
+	{ "new-licensee",     required_argument, NULL, 'k' },
+	{ "old-licensee",     required_argument, NULL, 'l' },
+	{ "mbc-type",         required_argument, NULL, 'm' },
+	{ "rom-version",      required_argument, NULL, 'n' },
+	{ "pad-value",        required_argument, NULL, 'p' },
+	{ "ram-size",         required_argument, NULL, 'r' },
+	{ "sgb-compatible",   no_argument,       NULL, 's' },
+	{ "title",            required_argument, NULL, 't' },
+	{ "version",          no_argument,       NULL, 'V' },
+	{ "validate",         no_argument,       NULL, 'v' },
+	{ NULL,               no_argument,       NULL, 0   }
+};
+
 static void print_usage(void)
 {
-	printf(
-"usage: rgbfix [-CcjsVv] [-f fix_spec] [-i game_id] [-k licensee_str]\n"
-"              [-l licensee_id] [-m mbc_type] [-n rom_version] [-p pad_value]\n"
-"              [-r ram_size] [-t title_str] file\n");
+	fputs(
+"Usage: rgbfix [-jsVv] [-C | -c] [-f <fix_spec>] [-i <game_id>] [-k <licensee>]\n"
+"              [-l <licensee_byte>] [-m <mbc_type>] [-n <rom_version>]\n"
+"              [-p <pad_value>] [-r <ram_size>] [-t <title_str>] <file>\n"
+"Useful options:\n"
+"    -m, --mbc-type <value>      set the MBC type byte to this value; refer\n"
+"                                  to the man page for a list of values\n"
+"    -p, --pad-value <value>     pad to the next valid size using this value\n"
+"    -r, --ram-size <code>       set the cart RAM size byte to this value\n"
+"    -V, --version               print RGBFIX version and exit\n"
+"    -v, --validate              fix the header logo and both checksums (-f lhg)\n"
+"\n"
+"For help, use `man rgbfix' or go to https://rednex.github.io/rgbds/\n",
+	      stderr);
 	exit(1);
 }
 
@@ -66,7 +108,8 @@ int main(int argc, char *argv[])
 	int version = 0;   /* mask ROM version number */
 	int padvalue = 0;  /* to pad the rom with if it changes size */
 
-	while ((ch = getopt(argc, argv, "Ccf:i:jk:l:m:n:p:sr:t:Vv")) != -1) {
+	while ((ch = musl_getopt_long_only(argc, argv, optstring, longopts,
+					   NULL)) != -1) {
 		switch (ch) {
 		case 'C':
 			coloronly = true;
@@ -194,8 +237,10 @@ int main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
-	if (argc == 0)
+	if (argc == 0) {
+		fputs("FATAL: no input files\n", stderr);
 		print_usage();
+	}
 
 	/*
 	 * Open the ROM file
@@ -268,10 +313,7 @@ int main(int argc, char *argv[])
 		 * characters may conflict with the title.
 		 */
 
-		int n = snprintf((char *)header + 0x34, 16, "%s", title);
-
-		for (int i = 16; i > n; i--)
-			header[0x34 + i] = '\0';
+		strncpy((char *)header + 0x34, title, 16);
 	}
 
 	if (setid) {

@@ -1,141 +1,204 @@
 /*
  * This file is part of RGBDS.
  *
- * Copyright (c) 1997-2018, Carsten Sorensen and RGBDS contributors.
+ * Copyright (c) 1997-2019, Carsten Sorensen and RGBDS contributors.
  *
  * SPDX-License-Identifier: MIT
  */
 
-#include <stdint.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#include "extern/err.h"
 
 #include "link/object.h"
-#include "link/output.h"
+#include "link/symbol.h"
+#include "link/section.h"
 #include "link/assign.h"
 #include "link/patch.h"
-#include "link/mylink.h"
-#include "link/mapfile.h"
-#include "link/main.h"
-#include "link/library.h"
+#include "link/output.h"
 
+#include "extern/err.h"
+#include "extern/getopt.h"
 #include "version.h"
 
-enum eBlockType {
-	BLOCK_COMMENT,
-	BLOCK_OBJECTS,
-	BLOCK_LIBRARIES,
-	BLOCK_OUTPUT
-};
+bool isDmgMode;               /* -d */
+char const *linkerScriptName; /* -l */
+char const *mapFileName;      /* -m */
+char const *symFileName;      /* -n */
+char const *overlayFileName;  /* -O */
+char const *outputFileName;   /* -o */
+uint8_t padValue;             /* -p */
+bool is32kMode;               /* -t */
+bool beVerbose;               /* -v */
+bool isWRA0Mode;              /* -w */
 
-int32_t options;
-int32_t fillchar;
-char *smartlinkstartsymbol;
-
-/*
- * Print the usagescreen
- */
-
-static void print_usage(void)
+FILE *openFile(char const *fileName, char const *mode)
 {
-	printf(
-"usage: rgblink [-dtVw] [-l linkerscript] [-m mapfile] [-n symfile] [-O overlay]\n"
-"               [-o outfile] [-p pad_value] [-s symbol] file [...]\n");
-	exit(1);
+	if (!fileName)
+		return NULL;
+
+	FILE *file = fopen(fileName, mode);
+
+	if (!file)
+		err(1, "Could not open file \"%s\"", fileName);
+
+	return file;
 }
 
+/* Short options */
+static char const *optstring = "dl:m:n:O:o:p:s:tVvw";
+
 /*
- * The main routine
+ * Equivalent long options
+ * Please keep in the same order as short opts
+ *
+ * Also, make sure long opts don't create ambiguity:
+ * A long opt's name should start with the same letter as its short opt,
+ * except if it doesn't create any ambiguity (`verbose` versus `version`).
+ * This is because long opt matching, even to a single char, is prioritized
+ * over short opt matching
  */
+static struct option const longopts[] = {
+	{ "dmg",          no_argument,       NULL, 'd' },
+	{ "linkerscript", required_argument, NULL, 'l' },
+	{ "map",          required_argument, NULL, 'm' },
+	{ "sym",          required_argument, NULL, 'n' },
+	{ "overlay",      required_argument, NULL, 'O' },
+	{ "output",       required_argument, NULL, 'o' },
+	{ "pad",          required_argument, NULL, 'p' },
+	{ "smart",        required_argument, NULL, 's' },
+	{ "tiny",         no_argument,       NULL, 't' },
+	{ "version",      no_argument,       NULL, 'V' },
+	{ "verbose",      no_argument,       NULL, 'v' },
+	{ "wramx",        no_argument,       NULL, 'w' },
+	{ NULL,           no_argument,       NULL, 0   }
+};
+
+/**
+ * Prints the program's usage to stdout.
+ */
+static void printUsage(void)
+{
+	fputs(
+"Usage: rgblink [-dtVvw] [-l script] [-m map_file] [-n sym_file]\n"
+"               [-O overlay_file] [-o out_file] [-p pad_value] [-s symbol]\n"
+"               <file> ...\n"
+"Useful options:\n"
+"    -l, --linkerscript <path>  set the input linker script\n"
+"    -m, --map <path>           set the output map file\n"
+"    -n, --sym <path>           set the output symbol list file\n"
+"    -o, --output <path>        set the output file\n"
+"    -p, --pad <value>          set the value to pad between sections with\n"
+"    -V, --version              print RGBLINK version and exits\n"
+"\n"
+"For help, use `man rgblink' or go to https://rednex.github.io/rgbds/\n",
+	      stderr);
+}
+
+/**
+ * Cleans up what has been done
+ * Mostly here to please tools such as `valgrind` so actual errors can be seen
+ */
+static void cleanup(void)
+{
+	obj_Cleanup();
+}
 
 int main(int argc, char *argv[])
 {
-	int ch;
-	char *ep;
+	int optionChar;
+	char *endptr; /* For error checking with `strtol` */
+	unsigned long value; /* For storing `strtoul`'s return value */
 
-	if (argc == 1)
-		print_usage();
-
-	while ((ch = getopt(argc, argv, "dl:m:n:O:o:p:s:tVw")) != -1) {
-		switch (ch) {
+	/* Parse options */
+	while ((optionChar = musl_getopt_long_only(argc, argv, optstring,
+						   longopts, NULL)) != -1) {
+		switch (optionChar) {
+		case 'd':
+			isDmgMode = true;
+			isWRA0Mode = true;
+			break;
 		case 'l':
-			SetLinkerscriptName(optarg);
+			linkerScriptName = optarg;
 			break;
 		case 'm':
-			SetMapfileName(optarg);
+			mapFileName = optarg;
 			break;
 		case 'n':
-			SetSymfileName(optarg);
-			break;
-		case 'o':
-			out_Setname(optarg);
+			symFileName = optarg;
 			break;
 		case 'O':
-			out_SetOverlayname(optarg);
-			options |= OPT_OVERLAY;
+			overlayFileName = optarg;
+			break;
+		case 'o':
+			outputFileName = optarg;
 			break;
 		case 'p':
-			fillchar = strtoul(optarg, &ep, 0);
-			if (optarg[0] == '\0' || *ep != '\0')
+			value = strtoul(optarg, &endptr, 0);
+			if (optarg[0] == '\0' || *endptr != '\0')
 				errx(1, "Invalid argument for option 'p'");
-			if (fillchar < 0 || fillchar > 0xFF)
-				errx(1, "Argument for option 'p' must be between 0 and 0xFF");
+			if (value > 0xFF)
+				errx(1, "Argument for 'p' must be a byte (between 0 and 0xFF)");
+			padValue = value;
 			break;
 		case 's':
-			options |= OPT_SMART_C_LINK;
-			smartlinkstartsymbol = optarg;
+			/* FIXME: nobody knows what this does, figure it out */
+			(void)optarg;
+			warnx("Nobody has any idea what `-s` does");
 			break;
 		case 't':
-			options |= OPT_TINY;
-			break;
-		case 'd':
-			/*
-			 * Set to set WRAM as a single continuous block as on
-			 * DMG. All WRAM sections must be WRAM0 as bankable WRAM
-			 * sections do not exist in this mode. A WRAMX section
-			 * will raise an error. VRAM bank 1 can't be used if
-			 * this option is enabled either.
-			 *
-			 * This option implies OPT_CONTWRAM.
-			 */
-			options |= OPT_DMG_MODE;
-			/* FALLTHROUGH */
-		case 'w':
-			/*
-			 * Set to set WRAM as a single continuous block as on
-			 * DMG. All WRAM sections must be WRAM0 as bankable WRAM
-			 * sections do not exist in this mode. A WRAMX section
-			 * will raise an error.
-			 */
-			options |= OPT_CONTWRAM;
+			is32kMode = true;
 			break;
 		case 'V':
 			printf("rgblink %s\n", get_package_version_string());
 			exit(0);
+		case 'v':
+			beVerbose = true;
+			break;
+		case 'w':
+			isWRA0Mode = true;
+			break;
 		default:
-			print_usage();
-			/* NOTREACHED */
+			printUsage();
+			exit(1);
 		}
 	}
-	argc -= optind;
-	argv += optind;
 
-	if (argc == 0)
-		print_usage();
+	int curArgIndex = optind;
 
-	for (int32_t i = 0; i < argc; ++i)
-		obj_Readfile(argv[i]);
+	/* If no input files were specified, the user must have screwed up */
+	if (curArgIndex == argc) {
+		fputs("FATAL: no input files\n", stderr);
+		printUsage();
+		exit(1);
+	}
 
-	AddNeededModules();
-	AssignSections();
-	CreateSymbolTable();
-	Patch();
-	Output();
-	CloseMapfile();
+	/* Patch the size array depending on command-line options */
+	if (!is32kMode)
+		maxsize[SECTTYPE_ROM0] = 0x4000;
+	if (!isWRA0Mode)
+		maxsize[SECTTYPE_WRAM0] = 0x1000;
 
-	return 0;
+	/* Patch the bank ranges array depending on command-line options */
+	if (isDmgMode)
+		bankranges[SECTTYPE_VRAM][1] = BANK_MIN_VRAM;
+
+	/* Read all object files first, */
+	while (curArgIndex < argc)
+		obj_ReadFile(argv[curArgIndex++]);
+
+	/* then process them, */
+	obj_DoSanityChecks();
+	assign_AssignSections();
+	assign_Cleanup();
+
+	/* and finally output the result. */
+	patch_ApplyPatches();
+	out_WriteFiles();
+
+	/* Do cleanup before quitting, though. */
+	cleanup();
 }

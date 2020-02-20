@@ -22,12 +22,15 @@
 #include "asm/main.h"
 #include "asm/output.h"
 #include "asm/symbol.h"
+#include "asm/warning.h"
 
 #include "extern/err.h"
 
 #include "types.h"
 
 static struct sContext *pFileStack;
+static unsigned int nFileStackDepth;
+unsigned int nMaxRecursionDepth;
 static struct sSymbol *pCurrentMacro;
 static YY_BUFFER_STATE CurrentFlexHandle;
 static FILE *pCurrentFile;
@@ -40,6 +43,8 @@ static uint32_t nMacroCount;
 static char *pCurrentREPTBlock;
 static uint32_t nCurrentREPTBlockSize;
 static uint32_t nCurrentREPTBlockCount;
+static int32_t nCurrentREPTBodyFirstLine;
+static int32_t nCurrentREPTBodyLastLine;
 
 uint32_t ulMacroReturnValue;
 
@@ -51,12 +56,17 @@ uint32_t ulMacroReturnValue;
 #define STAT_isMacroArg		2
 #define STAT_isREPTBlock	3
 
+/* Max context stack size */
+
 /*
  * Context push and pop
  */
 static void pushcontext(void)
 {
 	struct sContext **ppFileStack;
+
+	if (++nFileStackDepth > nMaxRecursionDepth)
+		fatalerror("Recursion limit (%d) exceeded", nMaxRecursionDepth);
 
 	ppFileStack = &pFileStack;
 	while (*ppFileStack)
@@ -86,6 +96,8 @@ static void pushcontext(void)
 		(*ppFileStack)->pREPTBlock = pCurrentREPTBlock;
 		(*ppFileStack)->nREPTBlockSize = nCurrentREPTBlockSize;
 		(*ppFileStack)->nREPTBlockCount = nCurrentREPTBlockCount;
+		(*ppFileStack)->nREPTBodyFirstLine = nCurrentREPTBodyFirstLine;
+		(*ppFileStack)->nREPTBodyLastLine = nCurrentREPTBodyLastLine;
 		break;
 	default:
 		fatalerror("%s: Internal error.", __func__);
@@ -100,6 +112,11 @@ static int32_t popcontext(void)
 
 	if (nCurrentStatus == STAT_isREPTBlock) {
 		if (--nCurrentREPTBlockCount) {
+			char *pREPTIterationWritePtr;
+			unsigned long nREPTIterationNo;
+			int nNbCharsWritten;
+			int nNbCharsLeft;
+
 			yy_delete_buffer(CurrentFlexHandle);
 			CurrentFlexHandle =
 				yy_scan_bytes(pCurrentREPTBlock,
@@ -108,6 +125,31 @@ static int32_t popcontext(void)
 			sym_UseCurrentMacroArgs();
 			sym_SetMacroArgID(nMacroCount++);
 			sym_UseNewMacroArgs();
+
+			/* Increment REPT count in file path */
+			if (CurrentOptions.mode != RUN_MODE_USEDINC) {
+				pREPTIterationWritePtr =
+					strrchr(tzCurrentFileName, '~') + 1;
+				nREPTIterationNo =
+					strtoul(pREPTIterationWritePtr, NULL, 10);
+				nNbCharsLeft = sizeof(tzCurrentFileName)
+					- (pREPTIterationWritePtr - tzCurrentFileName);
+				nNbCharsWritten = snprintf(pREPTIterationWritePtr,
+							   nNbCharsLeft, "%lu",
+							   nREPTIterationNo + 1);
+				if (nNbCharsWritten >= nNbCharsLeft) {
+					/*
+					 * The string is probably corrupted somehow,
+					 * revert the change to avoid a bad error
+					 * output.
+					 */
+					sprintf(pREPTIterationWritePtr, "%lu",
+						nREPTIterationNo);
+					fatalerror("Cannot write REPT count to file path");
+				}
+			}
+
+			nLineNo = nCurrentREPTBodyFirstLine;
 			return 0;
 		}
 	}
@@ -123,18 +165,15 @@ static int32_t popcontext(void)
 	}
 
 	yy_delete_buffer(CurrentFlexHandle);
-	nLineNo = pLastFile->nLine;
+	nLineNo = nCurrentStatus == STAT_isREPTBlock ? nCurrentREPTBodyLastLine
+						     : pLastFile->nLine;
 
 	if (nCurrentStatus == STAT_isInclude)
 		fclose(pCurrentFile);
 
-	if (nCurrentStatus == STAT_isMacro) {
-		sym_FreeCurrentMacroArgs();
-		nLineNo += 1;
-	}
-
-	if (nCurrentStatus == STAT_isREPTBlock)
-		nLineNo += 1;
+	if (nCurrentStatus == STAT_isMacro
+	 || nCurrentStatus == STAT_isREPTBlock)
+		nLineNo++;
 
 	CurrentFlexHandle = pLastFile->FlexHandle;
 	strcpy((char *)tzCurrentFileName, (char *)pLastFile->tzFileName);
@@ -153,10 +192,13 @@ static int32_t popcontext(void)
 		pCurrentREPTBlock = pLastFile->pREPTBlock;
 		nCurrentREPTBlockSize = pLastFile->nREPTBlockSize;
 		nCurrentREPTBlockCount = pLastFile->nREPTBlockCount;
+		nCurrentREPTBodyFirstLine = pLastFile->nREPTBodyFirstLine;
 		break;
 	default:
 		fatalerror("%s: Internal error.", __func__);
 	}
+
+	nFileStackDepth--;
 
 	free(*ppLastFile);
 	*ppLastFile = NULL;
@@ -222,6 +264,53 @@ void fstk_Dump(void)
 	fprintf(stderr, "%s(%d)", tzCurrentFileName, nLineNo);
 }
 
+void fstk_DumpToStr(char *buf, size_t buflen)
+{
+	const struct sContext *pLastFile = pFileStack;
+	int retcode;
+	size_t len = buflen;
+
+	while (pLastFile) {
+		retcode = snprintf(&buf[buflen - len], len, "%s(%d) -> ",
+				   pLastFile->tzFileName, pLastFile->nLine);
+		if (retcode < 0)
+			fatalerror("Failed to dump file stack to string: %s",
+				   strerror(errno));
+		else if (retcode >= len)
+			len = 0;
+		else
+			len -= retcode;
+		pLastFile = pLastFile->pNext;
+	}
+
+	retcode = snprintf(&buf[buflen - len], len, "%s(%d)", tzCurrentFileName,
+			   nLineNo);
+	if (retcode < 0)
+		fatalerror("Failed to dump file stack to string: %s",
+			   strerror(errno));
+	else if (retcode >= len)
+		len = 0;
+	else
+		len -= retcode;
+
+	if (!len)
+		warning(WARNING_LONG_STR, "File stack dump too long, got truncated");
+}
+
+/*
+ * Dump the string expansion stack to stderr
+ */
+void fstk_DumpStringExpansions(void)
+{
+	const struct sStringExpansionPos *pExpansion = pCurrentStringExpansion;
+
+	while (pExpansion) {
+		fprintf(stderr, "while expanding symbol \"%s\"\n",
+			pExpansion->tzName);
+		pExpansion = pExpansion->pParent;
+	}
+}
+
 /*
  * Extra includepath stuff
  */
@@ -230,11 +319,25 @@ void fstk_AddIncludePath(char *s)
 	if (NextIncPath == MAXINCPATHS)
 		fatalerror("Too many include directories passed from command line");
 
-	if (snprintf(IncludePaths[NextIncPath++], _MAX_PATH, "%s", s) >= _MAX_PATH)
+	// Find last occurrence of slash; is it at the end of the string?
+	char const *lastSlash = strrchr(s, '/');
+	char const *pattern = lastSlash && *(lastSlash + 1) == 0 ? "%s" : "%s/";
+
+	if (snprintf(IncludePaths[NextIncPath++], _MAX_PATH, pattern,
+		     s) >= _MAX_PATH)
 		fatalerror("Include path too long '%s'", s);
 }
 
-FILE *fstk_FindFile(char *fname, char **incPathUsed)
+static void printdep(const char *fileName)
+{
+	if (dependfile) {
+		fprintf(dependfile, "%s: %s\n", tzTargetFileName, fileName);
+		if (oGeneratePhonyDeps)
+			fprintf(dependfile, "%s:\n", fileName);
+	}
+}
+
+FILE *fstk_FindFile(char const *fname, char **incPathUsed)
 {
 	char path[_MAX_PATH];
 	int32_t i;
@@ -246,9 +349,7 @@ FILE *fstk_FindFile(char *fname, char **incPathUsed)
 	f = fopen(fname, "rb");
 
 	if (f != NULL || errno != ENOENT) {
-		if (dependfile)
-			fprintf(dependfile, "%s: %s\n", tzObjectname, fname);
-
+		printdep(fname);
 		return f;
 	}
 
@@ -271,10 +372,8 @@ FILE *fstk_FindFile(char *fname, char **incPathUsed)
 		f = fopen(path, "rb");
 
 		if (f != NULL || errno != ENOENT) {
-			if (dependfile) {
-				fprintf(dependfile, "%s: %s\n", tzObjectname,
-					path);
-			}
+			printdep(path);
+
 			if (incPathUsed)
 				*incPathUsed = IncludePaths[i];
 			return f;
@@ -282,6 +381,8 @@ FILE *fstk_FindFile(char *fname, char **incPathUsed)
 	}
 
 	errno = ENOENT;
+	if (oGeneratedMissingIncludes)
+		printdep(fname);
 	return NULL;
 }
 
@@ -293,14 +394,23 @@ void fstk_RunInclude(char *tzFileName)
 	char *incPathUsed = "";
 	FILE *f = fstk_FindFile(tzFileName, &incPathUsed);
 
-	if (f == NULL)
-		err(1, "Unable to open included file '%s'", tzFileName);
+	if (f == NULL) {
+		if (oGeneratedMissingIncludes) {
+			oFailedOnMissingInclude = true;
+			return;
+		}
+		yyerror("Unable to open included file '%s': %s", tzFileName,
+			strerror(errno));
+		return;
+	}
 
 	pushcontext();
 	nLineNo = 1;
 	nCurrentStatus = STAT_isInclude;
 	snprintf(tzCurrentFileName, sizeof(tzCurrentFileName), "%s%s",
 		 incPathUsed, tzFileName);
+	if (CurrentOptions.verbose)
+		printf("Assembling %s\n", tzCurrentFileName);
 	pCurrentFile = f;
 	CurrentFlexHandle = yy_create_buffer(pCurrentFile);
 	yy_switch_to_buffer(CurrentFlexHandle);
@@ -308,7 +418,7 @@ void fstk_RunInclude(char *tzFileName)
 	/* Dirty hack to give the INCLUDE directive a linefeed */
 
 	yyunput('\n');
-	nLineNo -= 1;
+	nLineNo--;
 }
 
 /*
@@ -317,20 +427,25 @@ void fstk_RunInclude(char *tzFileName)
 uint32_t fstk_RunMacro(char *s)
 {
 	struct sSymbol *sym = sym_FindMacro(s);
+	int nPrintedChars;
 
-	if (sym == NULL)
+	if (sym == NULL || sym->pMacro == NULL)
 		return 0;
 
 	pushcontext();
 	sym_SetMacroArgID(nMacroCount++);
-	nLineNo = -1;
+	/* Minus 1 because there is a newline at the beginning of the buffer */
+	nLineNo = sym->nFileLine - 1;
 	sym_UseNewMacroArgs();
 	nCurrentStatus = STAT_isMacro;
-	if (CurrentOptions.mode != RUN_MODE_USEDINC)
-		strcpy(tzCurrentFileName, s);
-
-	if (sym->pMacro == NULL)
-		return 0;
+	if (CurrentOptions.mode != RUN_MODE_USEDINC) {
+		nPrintedChars = snprintf(tzCurrentFileName, _MAX_PATH + 1,
+				"%s::%s", sym->tzFileName, s);
+		if (nPrintedChars > _MAX_PATH) {
+			popcontext();
+			fatalerror("File name + macro name is too large to fit into buffer");
+		}
+	}
 
 	pCurrentMacro = sym;
 	CurrentFlexHandle = yy_scan_bytes(pCurrentMacro->pMacro,
@@ -386,17 +501,31 @@ void fstk_RunString(char *s)
 /*
  * Set up a repeat block for parsing
  */
-void fstk_RunRept(uint32_t count)
+void fstk_RunRept(uint32_t count, int32_t nReptLineNo)
 {
 	if (count) {
-		pushcontext();
+		static const char *tzReptStr = "::REPT~1";
+
+		/* For error printing to make sense, fake nLineNo */
+		nCurrentREPTBodyLastLine = nLineNo;
+		nLineNo = nReptLineNo;
 		sym_UseCurrentMacroArgs();
+		pushcontext();
 		sym_SetMacroArgID(nMacroCount++);
 		sym_UseNewMacroArgs();
 		nCurrentREPTBlockCount = count;
 		nCurrentStatus = STAT_isREPTBlock;
 		nCurrentREPTBlockSize = ulNewMacroSize;
 		pCurrentREPTBlock = tzNewMacro;
+		nCurrentREPTBodyFirstLine = nReptLineNo + 1;
+		nLineNo = nReptLineNo;
+
+		if (strlen(tzCurrentFileName) + strlen(tzReptStr) > _MAX_PATH)
+			fatalerror("Cannot append \"%s\" to file path",
+				   tzReptStr);
+		if (CurrentOptions.mode != RUN_MODE_USEDINC)
+			strcat(tzCurrentFileName, tzReptStr);
+
 		CurrentFlexHandle =
 			yy_scan_bytes(pCurrentREPTBlock, nCurrentREPTBlockSize);
 		yy_switch_to_buffer(CurrentFlexHandle);
@@ -406,23 +535,27 @@ void fstk_RunRept(uint32_t count)
 /*
  * Initialize the filestack routines
  */
-void fstk_Init(char *s)
+void fstk_Init(char *pFileName)
 {
-	char tzFileName[_MAX_PATH + 1];
 	char tzSymFileName[_MAX_PATH + 1 + 2];
 
-	snprintf(tzSymFileName, sizeof(tzSymFileName), "\"%s\"", s);
+	snprintf(tzSymFileName, sizeof(tzSymFileName), "\"%s\"", pFileName);
 	sym_AddString("__FILE__", tzSymFileName);
 
-	strcpy(tzFileName, s);
 	pFileStack = NULL;
-	pCurrentFile = fopen(tzFileName, "rb");
-	if (pCurrentFile == NULL)
-		err(1, "Unable to open file '%s'", tzFileName);
+	if (strcmp(pFileName, "-") == 0) {
+		pCurrentFile = stdin;
+	} else {
+		pCurrentFile = fopen(pFileName, "rb");
+		if (pCurrentFile == NULL)
+			yyerror("Unable to open file '%s': %s", pFileName,
+				strerror(errno));
+	}
+	nFileStackDepth = 0;
 
 	nMacroCount = 0;
 	nCurrentStatus = STAT_isInclude;
-	snprintf(tzCurrentFileName, _MAX_PATH + 1, "%s", tzFileName);
+	snprintf(tzCurrentFileName, _MAX_PATH + 1, "%s", pFileName);
 	CurrentFlexHandle = yy_create_buffer(pCurrentFile);
 	yy_switch_to_buffer(CurrentFlexHandle);
 	nLineNo = 1;

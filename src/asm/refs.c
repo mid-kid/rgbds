@@ -1,20 +1,21 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "helpers.h"
+#include "asm/warning.h"
+#include "asm/util.h"
 #include "asm/refs.h"
 #include "asm/main.h"
 #include "asm/asm.h"
-
-#define SYMF_USED 0x400
 
 struct file {
 	struct file *next;
 	int symbols_len;
 	int symbols_arrlen;
 	struct sSymbol **symbols;
-	int used:1;
-	int in_section:1;
-	int has_charmap:1;
+	unsigned used:1;
+	unsigned in_section:1;
+	unsigned has_charmap:1;
 	char name[];
 };
 static struct file *files[HASHSIZE];
@@ -55,7 +56,7 @@ static void **ptrarr_add(void ***arr, int *arrlen, int *len, void *item)
 
 static struct file **file_find(char *filename)
 {
-	struct file **file = &(files[calchash(filename)]);
+	struct file **file = &(files[calchash(filename) % HASHSIZE]);
 	while (*file != NULL) {
 		if (strcmp((*file)->name, filename) == 0) break;
 		file = &((*file)->next);
@@ -104,17 +105,12 @@ static void file_usefile(char *filename)
 static void putsym(struct sSymbol *symbol)
 {
 	fprintf(stderr, "%s (%s):", symbol->tzName, symbol->tzFileName);
-	if (symbol->nType & SYMF_RELOC) fprintf(stderr, " RELOC");
-	if (symbol->nType & SYMF_EQU) fprintf(stderr, " EQU");
-	if (symbol->nType & SYMF_SET) fprintf(stderr, " SET");
-	if (symbol->nType & SYMF_EXPORT) fprintf(stderr, " EXPORT");
-	if (symbol->nType & SYMF_IMPORT) fprintf(stderr, " IMPORT");
-	if (symbol->nType & SYMF_LOCAL) fprintf(stderr, " LOCAL");
-	if (symbol->nType & SYMF_DEFINED) fprintf(stderr, " DEFINED");
-	if (symbol->nType & SYMF_MACRO) fprintf(stderr, " MACRO");
-	if (symbol->nType & SYMF_STRING) fprintf(stderr, " STRING");
-	if (symbol->nType & SYMF_CONST) fprintf(stderr, " CONST");
-	if (symbol->nType & SYMF_USED) fprintf(stderr, " USED");
+	if (symbol->type & SYM_LABEL) fprintf(stderr, " LABEL");
+	if (symbol->type & SYM_EQU) fprintf(stderr, " EQU");
+	if (symbol->type & SYM_SET) fprintf(stderr, " SET");
+	if (symbol->type & SYM_MACRO) fprintf(stderr, " MACRO");
+	if (symbol->type & SYM_EQUS) fprintf(stderr, " EQUS");
+	if (symbol->type & SYM_REF) fprintf(stderr, " REF");
 	putc('\n', stderr);
 }
 
@@ -129,11 +125,11 @@ struct sSymbol *refs_usesymbol(struct sSymbol *symbol)
 	//   we shouldn't just ignore all symbols created with macros either.
 	// Please use EQU to have a file "claim" ownership of a certain symbol.
 
-	// It's safe to say that a symbol that doesn't have SYMF_SET
+	// It's safe to say that a symbol that doesn't have SYM_SET
 	//   at the time of use will never get it since that's a hard error.
-	if (nPass == 2 && symbol && symbol != pPCSymbol
-			&& !(symbol->nType & SYMF_SET)) {
-		symbol->nType |= SYMF_USED;
+	if (symbol && symbol != pPCSymbol
+			&& !(symbol->type == SYM_SET)) {
+		symbol->isUsed = 1;
 		struct file *file = file_addref(tzCurrentFileName, symbol);
 		if (pCurrentSection) file->in_section = 1;
 	}
@@ -142,22 +138,18 @@ struct sSymbol *refs_usesymbol(struct sSymbol *symbol)
 
 // TODO: Actually check which characters from which file are used.
 void refs_addcharmap(void) {
-	if (nPass == 2) {
-		struct file *file = file_add(tzCurrentFileName);
-		file->has_charmap = 1;
-	}
+	struct file *file = file_add(tzCurrentFileName);
+	file->has_charmap = 1;
 }
 void refs_usecharmap(void) {
-	if (nPass == 2) {
-		for (struct file **hashfile = files;
-				hashfile < files + HASHSIZE; hashfile++) {
-			struct file *file = *hashfile;
-			while (file) {
-				// HACK: Includes every file that has a charmap
-				if (file->has_charmap)
-					file->in_section = 1;
-				file = file->next;
-			}
+	for (struct file **hashfile = files;
+			hashfile < files + HASHSIZE; hashfile++) {
+		struct file *file = *hashfile;
+		while (file) {
+			// HACK: Includes every file that has a charmap
+			if (file->has_charmap)
+				file->in_section = 1;
+			file = file->next;
 		}
 	}
 }
@@ -170,7 +162,7 @@ void refs_writeusedfiles(char *tzMainfile)
 				hashsym < tHashedSymbols + HASHSIZE; hashsym++) {
 			struct sSymbol *symbol = *hashsym;
 			while (symbol) {
-				if (!(symbol->nType & SYMF_USED)) {
+				if (!(symbol->isUsed)) {
 					symbol = symbol->pNext;
 					continue;
 				}

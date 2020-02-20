@@ -28,7 +28,6 @@
 extern int32_t nLineNo;
 extern uint32_t nTotalLines;
 extern uint32_t nPC;
-extern uint32_t nPass;
 extern uint32_t nIFDepth;
 extern bool skipElif;
 extern uint32_t nUnionDepth;
@@ -40,6 +39,7 @@ extern struct sSymbol *tHashedSymbols[HASHSIZE];
 extern struct sSymbol *pPCSymbol;
 extern bool oDontExpandStrings;
 
-size_t symvaluetostring(char *dest, size_t maxLength, char *sym);
+size_t symvaluetostring(char *dest, size_t maxLength, char *sym,
+			const char *mode);
 
 #endif /* RGBDS_ASM_ASM_H */

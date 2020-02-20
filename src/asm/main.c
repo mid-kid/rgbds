@@ -14,16 +14,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
+#include <errno.h>
 
 #include "asm/symbol.h"
 #include "asm/fstack.h"
 #include "asm/lexer.h"
 #include "asm/output.h"
 #include "asm/main.h"
+#include "asm/charmap.h"
+#include "asm/warning.h"
 #include "asm/refs.h"
 
 #include "extern/err.h"
+#include "extern/getopt.h"
 
 #include "helpers.h"
 #include "version.h"
@@ -38,13 +41,19 @@ char **cldefines;
 
 clock_t nStartClock, nEndClock;
 int32_t nLineNo;
-uint32_t nTotalLines, nPass, nPC, nIFDepth, nUnionDepth, nErrors;
+uint32_t nTotalLines, nPC, nIFDepth, nUnionDepth;
 bool skipElif;
 uint32_t unionStart[128], unionSize[128];
 
-/* extern int yydebug; */
+#if defined(YYDEBUG) && YYDEBUG
+extern int yydebug;
+#endif
 
 FILE *dependfile;
+bool oGeneratedMissingIncludes;
+bool oFailedOnMissingInclude;
+bool oGeneratePhonyDeps;
+char *tzTargetFileName;
 
 /*
  * Option stack
@@ -143,7 +152,7 @@ void opt_Parse(char *s)
 			newopt.gbgfx[2] = s[3];
 			newopt.gbgfx[3] = s[4];
 		} else {
-			errx(1, "Must specify exactly 4 characters for option 'g'");
+			yyerror("Must specify exactly 4 characters for option 'g'");
 		}
 		break;
 	case 'b':
@@ -151,7 +160,7 @@ void opt_Parse(char *s)
 			newopt.binary[0] = s[1];
 			newopt.binary[1] = s[2];
 		} else {
-			errx(1, "Must specify exactly 2 characters for option 'b'");
+			yyerror("Must specify exactly 2 characters for option 'b'");
 		}
 		break;
 	case 'z':
@@ -160,16 +169,16 @@ void opt_Parse(char *s)
 			unsigned int fillchar;
 
 			result = sscanf(&s[1], "%x", &fillchar);
-			if (!((result == EOF) || (result == 1)))
-				errx(1, "Invalid argument for option 'z'");
-
-			newopt.fillchar = fillchar;
+			if (result != EOF && result != 1)
+				yyerror("Invalid argument for option 'z'");
+			else
+				newopt.fillchar = fillchar;
 		} else {
-			errx(1, "Invalid argument for option 'z'");
+			yyerror("Invalid argument for option 'z'");
 		}
 		break;
 	default:
-		fatalerror("Unknown option");
+		yyerror("Unknown option");
 		break;
 	}
 
@@ -241,56 +250,63 @@ static void opt_ParseDefines(void)
 		sym_AddString(cldefines[i], cldefines[i + 1]);
 }
 
+/* Escapes Make-special chars from a string */
+static char *make_escape(const char *str)
+{
+	char * const escaped_str = malloc(strlen(str) * 2 + 1);
+	char *dest = escaped_str;
+
+	if (escaped_str == NULL)
+		err(1, "%s: Failed to allocate memory", __func__);
+
+	while (*str) {
+		/* All dollars needs to be doubled */
+		if (*str == '$')
+			*dest++ = '$';
+		*dest++ = *str++;
+	}
+	*dest = '\0';
+
+	return escaped_str;
+}
+
+/* Short options */
+static char const *optstring = "b:D:Eg:hi:LM:o:p:r:VvW:wm:";
+
+/* Variables for the long-only options */
+static int depType; /* Variants of `-M` */
+
 /*
- * Error handling
+ * Equivalent long options
+ * Please keep in the same order as short opts
+ *
+ * Also, make sure long opts don't create ambiguity:
+ * A long opt's name should start with the same letter as its short opt,
+ * except if it doesn't create any ambiguity (`verbose` versus `version`).
+ * This is because long opt matching, even to a single char, is prioritized
+ * over short opt matching
  */
-void verror(const char *fmt, va_list args)
-{
-	fprintf(stderr, "ERROR: ");
-	fstk_Dump();
-	fprintf(stderr, ":\n    ");
-	vfprintf(stderr, fmt, args);
-	fprintf(stderr, "\n");
-	nErrors += 1;
-}
-
-void yyerror(const char *fmt, ...)
-{
-	va_list args;
-
-	va_start(args, fmt);
-	verror(fmt, args);
-	va_end(args);
-}
-
-noreturn_ void fatalerror(const char *fmt, ...)
-{
-	va_list args;
-
-	va_start(args, fmt);
-	verror(fmt, args);
-	va_end(args);
-
-	exit(5);
-}
-
-void warning(const char *fmt, ...)
-{
-	if (!CurrentOptions.warnings)
-		return;
-
-	va_list args;
-
-	va_start(args, fmt);
-
-	fprintf(stderr, "warning: ");
-	fstk_Dump();
-	fprintf(stderr, ":\n    ");
-	vfprintf(stderr, fmt, args);
-	fprintf(stderr, "\n");
-
-	va_end(args);
-}
+static struct option const longopts[] = {
+	{ "binary-digits",    required_argument, NULL,     'b' },
+	{ "define",           required_argument, NULL,     'D' },
+	{ "export-all",       no_argument,       NULL,     'E' },
+	{ "gfx-chars",        required_argument, NULL,     'g' },
+	{ "halt-without-nop", no_argument,       NULL,     'h' },
+	{ "include",          required_argument, NULL,     'i' },
+	{ "preserve-ld",      no_argument,       NULL,     'L' },
+	{ "dependfile",       required_argument, NULL,     'M' },
+	{ "MG",               no_argument,       &depType, 'G' },
+	{ "MP",               no_argument,       &depType, 'P' },
+	{ "MT",               required_argument, &depType, 'T' },
+	{ "MQ",               required_argument, &depType, 'Q' },
+	{ "output",           required_argument, NULL,     'o' },
+	{ "pad-value",        required_argument, NULL,     'p' },
+	{ "recursion-depth",  required_argument, NULL,     'r' },
+	{ "version",          no_argument,       NULL,     'V' },
+	{ "verbose",          no_argument,       NULL,     'v' },
+	{ "warning",          required_argument, NULL,     'W' },
+	{ NULL,               no_argument,       NULL,     0   }
+};
 
 static enum run_mode parse_run_mode(char *mode_string)
 {
@@ -303,9 +319,20 @@ static enum run_mode parse_run_mode(char *mode_string)
 
 static void print_usage(void)
 {
-	printf(
-"usage: rgbasm [-EhLVvw] [-b chars] [-Dname[=value]] [-g chars] [-i path]\n"
-"              [-M dependfile] [-o outfile] [-p pad_value] [-m mode] file.asm\n");
+	fputs(
+"Usage: rgbasm [-EhLVvw] [-b chars] [-D name[=value]] [-g chars] [-i path]\n"
+"              [-M depend_file] [-MG] [-MP] [-MT target_file] [-MQ target_file]\n"
+"              [-o out_file] [-p pad_value] [-r depth] [-W warning] [-m mode] <file> ...\n"
+"Useful options:\n"
+"    -E, --export-all         export all labels\n"
+"    -M, --dependfile <path>  set the output dependency file\n"
+"    -o, --output <path>      set the output object file\n"
+"    -p, --pad-value <value>  set the value to use for `ds'\n"
+"    -V, --version            print RGBASM version and exit\n"
+"    -W, --warning <warning>  enable or disable warnings\n"
+"\n"
+"For help, use `man rgbasm' or go to https://rednex.github.io/rgbds/\n",
+	      stderr);
 	exit(1);
 }
 
@@ -327,10 +354,16 @@ int main(int argc, char *argv[])
 	if (!cldefines)
 		fatalerror("No memory for command line defines");
 
-	if (argc == 1)
-		print_usage();
+#if defined(YYDEBUG) && YYDEBUG
+	yydebug = 1;
+#endif
 
-	/* yydebug=1; */
+	nMaxRecursionDepth = 64;
+	oGeneratePhonyDeps = false;
+	oGeneratedMissingIncludes = false;
+	oFailedOnMissingInclude = false;
+	tzTargetFileName = NULL;
+	size_t nTargetFileNameLen = 0;
 
 	DefaultOptions.gbgfx[0] = '0';
 	DefaultOptions.gbgfx[1] = '1';
@@ -349,7 +382,8 @@ int main(int argc, char *argv[])
 
 	newopt = CurrentOptions;
 
-	while ((ch = getopt(argc, argv, "b:D:Eg:hi:LM:o:p:Vvwm:")) != -1) {
+	while ((ch = musl_getopt_long_only(argc, argv, optstring, longopts,
+					   NULL)) != -1) {
 		switch (ch) {
 		case 'b':
 			if (strlen(optarg) == 2) {
@@ -385,10 +419,13 @@ int main(int argc, char *argv[])
 			newopt.optimizeloads = false;
 			break;
 		case 'M':
-			dependfile = fopen(optarg, "w");
+			if (!strcmp("-", optarg))
+				dependfile = stdout;
+			else
+				dependfile = fopen(optarg, "w");
 			if (dependfile == NULL)
-				err(1, "Could not open dependfile %s", optarg);
-
+				err(1, "Could not open dependfile %s",
+				    optarg);
 			break;
 		case 'o':
 			out_SetFileName(optarg);
@@ -403,11 +440,20 @@ int main(int argc, char *argv[])
 				errx(1, "Argument for option 'p' must be between 0 and 0xFF");
 
 			break;
+		case 'r':
+			nMaxRecursionDepth = strtoul(optarg, &ep, 0);
+
+			if (optarg[0] == '\0' || *ep != '\0')
+				errx(1, "Invalid argument for option 'r'");
+			break;
 		case 'V':
 			printf("rgbasm %s\n", get_package_version_string());
 			exit(0);
 		case 'v':
 			newopt.verbose = true;
+			break;
+		case 'W':
+			processWarningFlag(optarg);
 			break;
 		case 'w':
 			newopt.warnings = false;
@@ -415,6 +461,45 @@ int main(int argc, char *argv[])
 		case 'm':
 			newopt.mode = parse_run_mode(optarg);
 			break;
+
+		/* Long-only options */
+		case 0:
+			if (depType) {
+				switch (depType) {
+				case 'G':
+					oGeneratedMissingIncludes = true;
+					break;
+				case 'P':
+					oGeneratePhonyDeps = true;
+					break;
+				case 'Q':
+				case 'T':
+					if (optind == argc)
+						errx(1, "-M%c takes a target file name argument",
+						     depType);
+					ep = optarg;
+					if (depType == 'Q')
+						ep = make_escape(ep);
+
+					nTargetFileNameLen += strlen(ep) + 1;
+					tzTargetFileName =
+						realloc(tzTargetFileName,
+							nTargetFileNameLen + 1);
+					if (tzTargetFileName == NULL)
+						err(1, "Cannot append new file to target file list");
+					strcat(tzTargetFileName, ep);
+					if (depType == 'Q')
+						free(ep);
+					char *ptr = tzTargetFileName +
+						strlen(tzTargetFileName);
+					*ptr++ = ' ';
+					*ptr = '\0';
+					break;
+				}
+			}
+			break;
+
+		/* Unrecognized options */
 		default:
 			print_usage();
 			/* NOTREACHED */
@@ -423,12 +508,17 @@ int main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
+	if (tzTargetFileName == NULL)
+		tzTargetFileName = tzObjectname;
+
 	opt_SetCurrentOptions(&newopt);
 
 	DefaultOptions = CurrentOptions;
 
-	if (argc == 0)
+	if (argc == 0) {
+		fputs("FATAL: no input files\n", stderr);
 		print_usage();
+	}
 
 	tzMainfile = argv[argc - 1];
 
@@ -438,10 +528,10 @@ int main(int argc, char *argv[])
 		printf("Assembling %s\n", tzMainfile);
 
 	if (dependfile) {
-		if (!tzObjectname)
-			errx(1, "Dependency files can only be created if an output object file is specified.\n");
+		if (!tzTargetFileName)
+			errx(1, "Dependency files can only be created if a target file is specified with either -o, -MQ or -MT.\n");
 
-		fprintf(dependfile, "%s: %s\n", tzObjectname, tzMainfile);
+		fprintf(dependfile, "%s: %s\n", tzTargetFileName, tzMainfile);
 	}
 
 	nStartClock = clock();
@@ -452,21 +542,19 @@ int main(int argc, char *argv[])
 	skipElif = true;
 	nUnionDepth = 0;
 	nPC = 0;
-	nPass = 1;
-	nErrors = 0;
-	sym_PrepPass1();
+	sym_Init();
 	sym_SetExportAll(CurrentOptions.exportall);
 	fstk_Init(tzMainfile);
 	opt_ParseDefines();
-
-	if (CurrentOptions.mode == RUN_MODE_ASSEMBLE && CurrentOptions.verbose)
-		printf("Pass 1...\n");
+	charmap_InitMain();
 
 	yy_set_state(LEX_STATE_NORMAL);
 	opt_SetCurrentOptions(&DefaultOptions);
 
-	if (yyparse() != 0 || nErrors != 0)
-		errx(1, "Assembly aborted in pass 1 (%ld errors)!", nErrors);
+	if (yyparse() != 0 || nbErrors != 0)
+		errx(1, "Assembly aborted (%ld errors)!", nbErrors);
+	if (dependfile)
+		fclose(dependfile);
 
 	if (nIFDepth != 0)
 		errx(1, "Unterminated IF construct (%ld levels)!", nIFDepth);
@@ -475,27 +563,6 @@ int main(int argc, char *argv[])
 		errx(1, "Unterminated UNION construct (%ld levels)!",
 		     nUnionDepth);
 	}
-
-	nTotalLines = 0;
-	nLineNo = 1;
-	nIFDepth = 0;
-	skipElif = true;
-	nUnionDepth = 0;
-	nPC = 0;
-	nPass = 2;
-	nErrors = 0;
-	sym_PrepPass2();
-	out_PrepPass2();
-	fstk_Init(tzMainfile);
-	yy_set_state(LEX_STATE_NORMAL);
-	opt_SetCurrentOptions(&DefaultOptions);
-	opt_ParseDefines();
-
-	if (CurrentOptions.mode == RUN_MODE_ASSEMBLE && CurrentOptions.verbose)
-		printf("Pass 2...\n");
-
-	if (yyparse() != 0 || nErrors != 0)
-		errx(1, "Assembly aborted in pass 2 (%ld errors)!", nErrors);
 
 	double timespent;
 
@@ -512,13 +579,20 @@ int main(int argc, char *argv[])
 			       (int)(60 / timespent * nTotalLines));
 	}
 
+	if (oFailedOnMissingInclude)
+		return 0;
+
 	switch (CurrentOptions.mode) {
 	case RUN_MODE_ASSEMBLE:
-		out_WriteObject();
-		return 0;
+		/* If no path specified, don't write file */
+		if (tzObjectname != NULL)
+			out_WriteObject();
+		break;
 	case RUN_MODE_USEDINC:
 		refs_writeusedfiles(tzMainfile);
-		return 0;
+		break;
+	case RUN_MODE_UNUSEDINC:
+	case RUN_MODE_UUSET:
 	default:
 		break;
 	}

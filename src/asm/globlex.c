@@ -14,12 +14,12 @@
 #include <string.h>
 
 #include "asm/asm.h"
-#include "asm/constexpr.h"
 #include "asm/lexer.h"
 #include "asm/main.h"
 #include "asm/rpn.h"
+#include "asm/section.h"
 #include "asm/symbol.h"
-#include "asm/symbol.h"
+#include "asm/warning.h"
 
 #include "helpers.h"
 
@@ -33,7 +33,7 @@ static int32_t gbgfx2bin(char ch)
 {
 	int32_t i;
 
-	for (i = 0; i <= 3; i += 1) {
+	for (i = 0; i <= 3; i++) {
 		if (CurrentOptions.gbgfx[i] == ch)
 			return i;
 	}
@@ -45,7 +45,7 @@ static int32_t binary2bin(char ch)
 {
 	int32_t i;
 
-	for (i = 0; i <= 1; i += 1) {
+	for (i = 0; i <= 1; i++) {
 		if (CurrentOptions.binary[i] == ch)
 			return i;
 	}
@@ -71,35 +71,39 @@ typedef int32_t(*x2bin) (char ch);
 
 static int32_t ascii2bin(char *s)
 {
-	int32_t radix = 10;
-	int32_t result = 0;
+	char *start = s;
+	uint32_t radix = 10;
+	uint32_t result = 0;
 	x2bin convertfunc = char2bin;
 
 	switch (*s) {
 	case '$':
 		radix = 16;
-		s += 1;
+		s++;
 		convertfunc = char2bin;
 		break;
 	case '&':
 		radix = 8;
-		s += 1;
+		s++;
 		convertfunc = char2bin;
 		break;
 	case '`':
 		radix = 4;
-		s += 1;
+		s++;
 		convertfunc = gbgfx2bin;
 		break;
 	case '%':
 		radix = 2;
-		s += 1;
+		s++;
 		convertfunc = binary2bin;
 		break;
 	default:
 		/* Handle below */
 		break;
 	}
+
+	const uint32_t max_q = UINT32_MAX / radix;
+	const uint32_t max_r = UINT32_MAX % radix;
 
 	if (*s == '\0') {
 		/*
@@ -108,15 +112,39 @@ static int32_t ascii2bin(char *s)
 		 */
 		yyerror("Invalid integer constant");
 	} else if (radix == 4) {
+		int32_t size = 0;
 		int32_t c;
 
 		while (*s != '\0') {
 			c = convertfunc(*s++);
 			result = result * 2 + ((c & 2) << 7) + (c & 1);
+			size++;
+		}
+
+		/*
+		 * Extending a graphics constant longer than 8 pixels,
+		 * the Game Boy tile width, produces a nonsensical result.
+		 */
+		if (size > 8) {
+			warning(WARNING_LARGE_CONSTANT, "Graphics constant '%s' is too long",
+				start);
 		}
 	} else {
-		while (*s != '\0')
-			result = result * radix + convertfunc(*s++);
+		bool overflow = false;
+
+		while (*s != '\0') {
+			int32_t digit = convertfunc(*s++);
+
+			if (result > max_q
+			 || (result == max_q && digit > max_r)) {
+				overflow = true;
+			}
+			result = result * radix + digit;
+		}
+
+		if (overflow)
+			warning(WARNING_LARGE_CONSTANT, "Integer constant '%s' is too large",
+				start);
 	}
 
 	return result;
@@ -124,19 +152,19 @@ static int32_t ascii2bin(char *s)
 
 uint32_t ParseFixedPoint(char *s, uint32_t size)
 {
-	uint32_t i = 0, dot = 0;
+	uint32_t i;
+	uint32_t dot = 0;
 
-	while (size && dot != 2) {
-		if (s[i] == '.')
-			dot += 1;
+	for (i = 0; i < size; i++) {
+		if (s[i] == '.') {
+			dot++;
 
-		if (dot < 2) {
-			size -= 1;
-			i += 1;
+			if (dot == 2)
+				break;
 		}
 	}
 
-	yyunputbytes(size);
+	yyskipbytes(i);
 
 	yylval.nConstValue = (int32_t)(atof(s) * 65536);
 
@@ -147,63 +175,125 @@ uint32_t ParseNumber(char *s, uint32_t size)
 {
 	char dest[256];
 
+	if (size > 255)
+		fatalerror("Number token too long");
+
 	strncpy(dest, s, size);
 	dest[size] = 0;
 	yylval.nConstValue = ascii2bin(dest);
 
+	yyskipbytes(size);
+
 	return 1;
+}
+
+/*
+ * If the symbol name ends before the end of the macro arg,
+ * return a pointer to the rest of the macro arg.
+ * Otherwise, return NULL.
+ */
+char *AppendMacroArg(char whichArg, char *dest, size_t *destIndex)
+{
+	char *marg;
+
+	if (whichArg == '@')
+		marg = sym_FindMacroArg(-1);
+	else if (whichArg >= '1' && whichArg <= '9')
+		marg = sym_FindMacroArg(whichArg - '0');
+	else
+		fatalerror("Invalid macro argument '\\%c' in symbol", whichArg);
+
+	if (!marg)
+		fatalerror("Macro argument '\\%c' not defined", whichArg);
+
+	char ch;
+
+	while ((ch = *marg) != 0) {
+		if ((ch >= 'a' && ch <= 'z')
+		 || (ch >= 'A' && ch <= 'Z')
+		 || (ch >= '0' && ch <= '9')
+		 || ch == '_'
+		 || ch == '@'
+		 || ch == '#'
+		 || ch == '.') {
+			if (*destIndex >= MAXSYMLEN)
+				fatalerror("Symbol too long");
+
+			dest[*destIndex] = ch;
+			(*destIndex)++;
+		} else {
+			return marg;
+		}
+
+		marg++;
+	}
+
+	return NULL;
 }
 
 uint32_t ParseSymbol(char *src, uint32_t size)
 {
 	char dest[MAXSYMLEN + 1];
-	int32_t copied = 0, size_backup = size;
+	size_t srcIndex = 0;
+	size_t destIndex = 0;
+	char *rest = NULL;
 
-	while (size && copied < MAXSYMLEN) {
-		if (*src == '\\') {
-			char *marg;
+	while (srcIndex < size) {
+		char ch = src[srcIndex++];
 
-			src += 1;
-			size -= 1;
+		if (ch == '\\') {
+			/*
+			 * We don't check if srcIndex is still less than size,
+			 * but that can only fail to be true when the
+			 * following char is neither '@' nor a digit.
+			 * In that case, AppendMacroArg() will catch the error.
+			 */
+			ch = src[srcIndex++];
 
-			if (*src == '@') {
-				marg = sym_FindMacroArg(-1);
-			} else if (*src >= '0' && *src <= '9') {
-				marg = sym_FindMacroArg(*src - '0');
-			} else {
-				fatalerror("Malformed ID");
-				return 0;
-			}
-
-			src += 1;
-			size -= 1;
-
-			if (marg) {
-				while (*marg)
-					dest[copied++] = *marg++;
-			}
+			rest = AppendMacroArg(ch, dest, &destIndex);
+			/* If the symbol's end was in the middle of the token */
+			if (rest)
+				break;
 		} else {
-			dest[copied++] = *src++;
-			size -= 1;
+			if (destIndex >= MAXSYMLEN)
+				fatalerror("Symbol too long");
+			dest[destIndex++] = ch;
 		}
 	}
 
-	if (copied >= MAXSYMLEN)
-		fatalerror("Symbol too long");
+	dest[destIndex] = 0;
 
-	dest[copied] = 0;
+	/* Tell the lexer we read all bytes that we did */
+	yyskipbytes(srcIndex);
 
-	if (!oDontExpandStrings && sym_isString(dest)) {
-		char *s;
+	/*
+	 * If an escape's expansion left some chars after the symbol's end,
+	 * such as the `::` in a `Backup\1` expanded to `BackupCamX::`,
+	 * put those into the buffer.
+	 * Note that this NEEDS to be done after the `yyskipbytes` above.
+	 */
+	if (rest)
+		yyunputstr(rest);
 
-		yyskipbytes(size_backup);
-		yyunputstr(s = sym_GetStringValue(dest));
+	/* If the symbol is an EQUS, expand it */
+	if (!oDontExpandStrings) {
+		struct sSymbol const *sym = sym_FindSymbol(dest);
 
-		while (*s) {
-			if (*s++ == '\n')
-				nLineNo -= 1;
+		if (sym && sym->type == SYM_EQUS) {
+			char *s;
+
+			lex_BeginStringExpansion(dest);
+
+			/* Feed the symbol's contents into the buffer */
+			yyunputstr(s = sym_GetStringValue(sym));
+
+			/* Lines inserted this way shall not increase nLineNo */
+			while (*s) {
+				if (*s++ == '\n')
+					nLineNo--;
+			}
+			return 0;
 		}
-		return 0;
 	}
 
 	strcpy(yylval.tzSym, dest);
@@ -221,9 +311,9 @@ uint32_t PutMacroArg(char *src, uint32_t size)
 		if (s != NULL)
 			yyunputstr(s);
 		else
-			yyerror("Macro argument not defined");
+			yyerror("Macro argument '\\%c' not defined", src[1]);
 	} else {
-		yyerror("Invalid macro argument");
+		yyerror("Invalid macro argument '\\%c'", src[1]);
 	}
 	return 0;
 }
@@ -401,6 +491,10 @@ const struct sLexInitString lexer_strings[] = {
 
 	{"incbin", T_POP_INCBIN},
 	{"charmap", T_POP_CHARMAP},
+	{"newcharmap", T_POP_NEWCHARMAP},
+	{"setcharmap", T_POP_SETCHARMAP},
+	{"pushc", T_POP_PUSHC},
+	{"popc", T_POP_POPC},
 
 	{"fail", T_POP_FAIL},
 	{"warn", T_POP_WARN},
@@ -413,6 +507,9 @@ const struct sLexInitString lexer_strings[] = {
 	{"rept", T_POP_REPT},
 	/* Not needed but we have it here just to protect the name */
 	{"endr", T_POP_ENDR},
+
+	{"load", T_POP_LOAD},
+	{"endl", T_POP_ENDL},
 
 	{"if", T_POP_IF},
 	{"else", T_POP_ELSE},
@@ -445,7 +542,7 @@ const struct sLexInitString lexer_strings[] = {
 
 	/*  Handled before in list of CPU instructions */
 	/* {"set", T_POP_SET}, */
-	{"=", T_POP_SET},
+	{"=", T_POP_EQUAL},
 
 	{"pushs", T_POP_PUSHS},
 	{"pops", T_POP_POPS},

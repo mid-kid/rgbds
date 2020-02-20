@@ -33,16 +33,22 @@ struct sContext {
 	char *pREPTBlock;
 	uint32_t nREPTBlockCount;
 	uint32_t nREPTBlockSize;
+	int32_t nREPTBodyFirstLine;
+	int32_t nREPTBodyLastLine;
 };
+
+extern unsigned int nMaxRecursionDepth;
 
 void fstk_RunInclude(char *tzFileName);
 void fstk_RunMacroArg(int32_t s);
 void fstk_Init(char *s);
 void fstk_Dump(void);
+void fstk_DumpToStr(char *buf, size_t len);
+void fstk_DumpStringExpansions(void);
 void fstk_AddIncludePath(char *s);
 uint32_t fstk_RunMacro(char *s);
-void fstk_RunRept(uint32_t count);
-FILE *fstk_FindFile(char *fname, char **incPathUsed);
+void fstk_RunRept(uint32_t count, int32_t nReptLineNo);
+FILE *fstk_FindFile(char const *fname, char **incPathUsed);
 int32_t fstk_GetLine(void);
 
 #endif /* RGBDS_ASM_FSTACK_H */

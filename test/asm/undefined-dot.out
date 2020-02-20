@@ -1,3 +1,0 @@
-ERROR: undefined-dot.asm(3):
-    '.' not defined
-error: Assembly aborted in pass 2 (1 errors)!

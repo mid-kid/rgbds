@@ -21,10 +21,14 @@ struct Options {
 	bool hardfix;
 	bool fix;
 	bool horizontal;
+	bool mirror;
 	bool unique;
+	bool colorcurve;
 	int trim;
-	char *mapfile;
-	bool mapout;
+	char *tilemapfile;
+	bool tilemapout;
+	char *attrmapfile;
+	bool attrmapout;
 	char *palfile;
 	bool palout;
 	char *outfile;
@@ -40,8 +44,10 @@ struct RGBColor {
 struct ImageOptions {
 	bool horizontal;
 	int trim;
-	char *mapfile;
-	bool mapout;
+	char *tilemapfile;
+	bool tilemapout;
+	char *attrmapfile;
+	bool attrmapout;
 	char *palfile;
 	bool palout;
 };
@@ -60,8 +66,8 @@ struct RawIndexedImage {
 	uint8_t **data;
 	struct RGBColor *palette;
 	int num_colors;
-	int width;
-	int height;
+	unsigned int width;
+	unsigned int height;
 };
 
 struct GBImage {
@@ -71,7 +77,7 @@ struct GBImage {
 	int trim;
 };
 
-struct Tilemap {
+struct Mapfile {
 	uint8_t *data;
 	int size;
 };

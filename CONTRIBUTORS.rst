@@ -22,7 +22,7 @@ Main contributors
 Other contributors
 ------------------
 
-- Ben10do
+- Ben Hetherington <dev@ben-h.uk>
 
 - Björn Höhrmann <bjoern@hoehrmann.de>
 
@@ -30,14 +30,22 @@ Other contributors
 
 - David Brotz <dbrotz007@gmail.com>
 
+- Eldred Habert <eldredhabert0@gmail.com>
+
 - The Musl C library <http://www.musl-libc.org>
 
 - obskyr <powpowd@gmail.com>
 
 - The OpenBSD Project <http://www.openbsd.org>
 
+- Quint Guvernator <quint@guvernator.net>
+
 - Sanqui <gsanky@gmail.com>
 
 - YamaArashi <shadow962@live.com>
 
 - yenatch <yenatch@gmail.com>
+
+- phs <phil@philhsmith.com>
+
+- jidoc01 <jidoc01@naver.com>

@@ -1,7 +1,7 @@
 /*
  * This file is part of RGBDS.
  *
- * Copyright (c) 1997-2018, Carsten Sorensen and RGBDS contributors.
+ * Copyright (c) 1997-2019, Carsten Sorensen and RGBDS contributors.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -10,6 +10,7 @@
  * Outputs an objectfile
  */
 
+#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -22,18 +23,16 @@
 #include "asm/main.h"
 #include "asm/output.h"
 #include "asm/rpn.h"
+#include "asm/section.h"
 #include "asm/symbol.h"
+#include "asm/warning.h"
 
 #include "extern/err.h"
 
-#include "common.h"
 #include "linkdefs.h"
-
-void out_SetCurrentSection(struct Section *pSect);
 
 struct Patch {
 	char tzFilename[_MAX_PATH + 1];
-	uint32_t nLine;
 	uint32_t nOffset;
 	uint8_t nType;
 	uint32_t nRPNSize;
@@ -43,15 +42,9 @@ struct Patch {
 
 struct PatchSymbol {
 	uint32_t ID;
-	struct sSymbol *pSymbol;
+	struct sSymbol const *pSymbol;
 	struct PatchSymbol *pNext;
 	struct PatchSymbol *pBucketNext; /* next symbol in hash table bucket */
-};
-
-struct SectionStackEntry {
-	struct Section *pSection;
-	struct sSymbol *pScope; /* Section's symbol scope */
-	struct SectionStackEntry *pNext;
 };
 
 struct PatchSymbol *tHashedPatchSymbols[HASHSIZE];
@@ -59,63 +52,6 @@ struct Section *pSectionList, *pCurrentSection;
 struct PatchSymbol *pPatchSymbols;
 struct PatchSymbol **ppPatchSymbolsTail = &pPatchSymbols;
 char *tzObjectname;
-struct SectionStackEntry *pSectionStack;
-
-/*
- * Section stack routines
- */
-void out_PushSection(void)
-{
-	struct SectionStackEntry *pSect;
-
-	pSect = malloc(sizeof(struct SectionStackEntry));
-	if (pSect == NULL)
-		fatalerror("No memory for section stack");
-
-	pSect->pSection = pCurrentSection;
-	pSect->pScope = sym_GetCurrentSymbolScope();
-	pSect->pNext = pSectionStack;
-	pSectionStack = pSect;
-}
-
-void out_PopSection(void)
-{
-	if (pSectionStack == NULL)
-		fatalerror("No entries in the section stack");
-
-	struct SectionStackEntry *pSect;
-
-	pSect = pSectionStack;
-	out_SetCurrentSection(pSect->pSection);
-	sym_SetCurrentSymbolScope(pSect->pScope);
-	pSectionStack = pSect->pNext;
-	free(pSect);
-}
-
-static uint32_t getmaxsectionsize(uint32_t secttype, char *sectname)
-{
-	switch (secttype) {
-	case SECT_ROM0:
-		return 0x8000; /* If ROMX sections not used */
-	case SECT_ROMX:
-		return 0x4000;
-	case SECT_VRAM:
-		return 0x2000;
-	case SECT_SRAM:
-		return 0x2000;
-	case SECT_WRAM0:
-		return 0x2000; /* If WRAMX sections not used */
-	case SECT_WRAMX:
-		return 0x1000;
-	case SECT_OAM:
-		return 0xA0;
-	case SECT_HRAM:
-		return 0x7F;
-	default:
-		break;
-	}
-	errx(1, "Section \"%s\" has an invalid section type.", sectname);
-}
 
 /*
  * Count the number of symbols used in this object
@@ -126,13 +62,12 @@ static uint32_t countsymbols(void)
 	uint32_t count = 0;
 
 	pSym = pPatchSymbols;
-
 	while (pSym) {
-		count += 1;
+		count++;
 		pSym = pSym->pNext;
 	}
 
-	return (count);
+	return count;
 }
 
 /*
@@ -144,13 +79,12 @@ static uint32_t countsections(void)
 	uint32_t count = 0;
 
 	pSect = pSectionList;
-
 	while (pSect) {
-		count += 1;
+		count++;
 		pSect = pSect->pNext;
 	}
 
-	return (count);
+	return count;
 }
 
 /*
@@ -163,11 +97,11 @@ static uint32_t countpatches(struct Section *pSect)
 
 	pPatch = pSect->pPatches;
 	while (pPatch) {
-		r += 1;
+		r++;
 		pPatch = pPatch->pNext;
 	}
 
-	return (r);
+	return r;
 }
 
 /*
@@ -184,7 +118,7 @@ static void fputlong(uint32_t i, FILE *f)
 /*
  * Write a NULL-terminated string to a file
  */
-static void fputstring(char *s, FILE *f)
+static void fputstring(char const *s, FILE *f)
 {
 	while (*s)
 		fputc(*s++, f);
@@ -204,12 +138,11 @@ static uint32_t getsectid(struct Section *pSect)
 	while (sec) {
 		if (sec == pSect)
 			return ID;
-		ID += 1;
+		ID++;
 		sec = sec->pNext;
 	}
 
-	fatalerror("%s: Unknown section", __func__);
-	return (uint32_t)(-1);
+	fatalerror("Unknown section '%s'", pSect->pzName);
 }
 
 /*
@@ -218,7 +151,6 @@ static uint32_t getsectid(struct Section *pSect)
 static void writepatch(struct Patch *pPatch, FILE *f)
 {
 	fputstring(pPatch->tzFilename, f);
-	fputlong(pPatch->nLine, f);
 	fputlong(pPatch->nOffset, f);
 	fputc(pPatch->nType, f);
 	fputlong(pPatch->nRPNSize, f);
@@ -240,7 +172,7 @@ static void writesection(struct Section *pSect, FILE *f)
 	fputlong(pSect->nBank, f);
 	fputlong(pSect->nAlign, f);
 
-	if ((pSect->nType == SECT_ROM0) || (pSect->nType == SECT_ROMX)) {
+	if (sect_HasData(pSect->nType)) {
 		struct Patch *pPatch;
 
 		fwrite(pSect->tData, 1, pSect->nPC, f);
@@ -257,42 +189,41 @@ static void writesection(struct Section *pSect, FILE *f)
 /*
  * Write a symbol to a file
  */
-static void writesymbol(struct sSymbol *pSym, FILE *f)
+static void writesymbol(struct sSymbol const *pSym, FILE *f)
 {
-	char symname[MAXSYMLEN * 2 + 1];
 	uint32_t type;
 	uint32_t offset;
 	int32_t sectid;
 
-	if (pSym->nType & SYMF_IMPORT) {
-		/* Symbol should be imported */
-		strcpy(symname, pSym->tzName);
+	if (!sym_IsDefined(pSym))
+		type = SYMTYPE_IMPORT;
+	else if (pSym->isExported)
+		type = SYMTYPE_EXPORT;
+	else
+		type = SYMTYPE_LOCAL;
+
+	switch (type) {
+	case SYMTYPE_LOCAL:
+		offset = pSym->nValue;
+		sectid = getsectid(pSym->pSection);
+		break;
+	case SYMTYPE_IMPORT:
 		offset = 0;
 		sectid = -1;
-		type = SYM_IMPORT;
-	} else {
-		strcpy(symname, pSym->tzName);
-
-		if (pSym->nType & SYMF_EXPORT) {
-			/* Symbol should be exported */
-			type = SYM_EXPORT;
-			offset = pSym->nValue;
-			if (pSym->nType & SYMF_CONST)
-				sectid = -1;
-			else
-				sectid = getsectid(pSym->pSection);
-		} else {
-			/* Symbol is local to this file */
-			type = SYM_LOCAL;
-			offset = pSym->nValue;
+		break;
+	case SYMTYPE_EXPORT:
+		offset = pSym->nValue;
+		if (pSym->type != SYM_LABEL)
+			sectid = -1;
+		else
 			sectid = getsectid(pSym->pSection);
-		}
+		break;
 	}
 
-	fputstring(symname, f);
+	fputstring(pSym->tzName, f);
 	fputc(type, f);
 
-	if (type != SYM_IMPORT) {
+	if (type != SYMTYPE_IMPORT) {
 		fputstring(pSym->tzFileName, f);
 		fputlong(pSym->nFileLine, f);
 
@@ -306,12 +237,12 @@ static void writesymbol(struct sSymbol *pSym, FILE *f)
  */
 static uint32_t nextID;
 
-static uint32_t addsymbol(struct sSymbol *pSym)
+static uint32_t addsymbol(struct sSymbol const *pSym)
 {
 	struct PatchSymbol *pPSym, **ppPSym;
 	uint32_t hash;
 
-	hash = calchash(pSym->tzName);
+	hash = sym_CalcHash(pSym->tzName);
 	ppPSym = &(tHashedPatchSymbols[hash]);
 
 	while ((*ppPSym) != NULL) {
@@ -344,12 +275,12 @@ static void addexports(void)
 {
 	int32_t i;
 
-	for (i = 0; i < HASHSIZE; i += 1) {
+	for (i = 0; i < HASHSIZE; i++) {
 		struct sSymbol *pSym;
 
 		pSym = tHashedSymbols[i];
 		while (pSym) {
-			if (pSym->nType & SYMF_EXPORT)
+			if (pSym->isExported)
 				addsymbol(pSym);
 			pSym = pSym->pNext;
 		}
@@ -379,19 +310,23 @@ struct Patch *allocpatch(void)
 /*
  * Create a new patch (includes the rpn expr)
  */
-void createpatch(uint32_t type, struct Expression *expr)
+void out_CreatePatch(uint32_t type, struct Expression *expr)
 {
 	struct Patch *pPatch;
 	uint16_t rpndata;
-	uint8_t rpnexpr[2048];
+	uint8_t *rpnexpr;
 	char tzSym[512];
 	uint32_t rpnptr = 0, symptr;
 
+	rpnexpr = malloc(expr->nRPNPatchSize);
+
+	if (rpnexpr == NULL)
+		fatalerror("No memory for patch RPN expression");
+
 	pPatch = allocpatch();
 	pPatch->nType = type;
-	strcpy(pPatch->tzFilename, tzCurrentFileName);
-	pPatch->nLine = nLineNo;
-	pPatch->nOffset = nPC;
+	fstk_DumpToStr(pPatch->tzFilename, sizeof(pPatch->tzFilename));
+	pPatch->nOffset = pCurrentSection->nPC;
 
 	while ((rpndata = rpn_PopByte(expr)) != 0xDEAD) {
 		switch (rpndata) {
@@ -403,11 +338,16 @@ void createpatch(uint32_t type, struct Expression *expr)
 			rpnexpr[rpnptr++] = rpn_PopByte(expr);
 			break;
 		case RPN_SYM:
+		{
 			symptr = 0;
 			while ((tzSym[symptr++] = rpn_PopByte(expr)) != 0)
 				;
 
-			if (sym_isConstant(tzSym)) {
+			struct sSymbol const *sym = sym_FindSymbol(tzSym);
+
+			if (!sym) {
+				break; // TODO: wtf?
+			} else if (sym_IsConstant(sym)) {
 				uint32_t value;
 
 				value = sym_GetConstantValue(tzSym);
@@ -417,11 +357,6 @@ void createpatch(uint32_t type, struct Expression *expr)
 				rpnexpr[rpnptr++] = value >> 16;
 				rpnexpr[rpnptr++] = value >> 24;
 			} else {
-				struct sSymbol *sym = sym_FindSymbol(tzSym);
-
-				if (sym == NULL)
-					break;
-
 				symptr = addsymbol(sym);
 				rpnexpr[rpnptr++] = RPN_SYM;
 				rpnexpr[rpnptr++] = symptr & 0xFF;
@@ -430,6 +365,7 @@ void createpatch(uint32_t type, struct Expression *expr)
 				rpnexpr[rpnptr++] = symptr >> 24;
 			}
 			break;
+		}
 		case RPN_BANK_SYM:
 		{
 			struct sSymbol *sym;
@@ -468,57 +404,10 @@ void createpatch(uint32_t type, struct Expression *expr)
 		}
 	}
 
-	pPatch->pRPN = malloc(rpnptr);
-	if (pPatch->pRPN != NULL) {
-		memcpy(pPatch->pRPN, rpnexpr, rpnptr);
-		pPatch->nRPNSize = rpnptr;
-	}
-}
+	assert(rpnptr == expr->nRPNPatchSize);
 
-/*
- * A quick check to see if we have an initialized section
- */
-static void checksection(void)
-{
-	if (pCurrentSection == NULL)
-		fatalerror("Code generation before SECTION directive");
-}
-
-/*
- * A quick check to see if we have an initialized section that can contain
- * this much initialized data
- */
-static void checkcodesection(void)
-{
-	checksection();
-	if (pCurrentSection->nType != SECT_ROM0 &&
-	    pCurrentSection->nType != SECT_ROMX) {
-		fatalerror("Section '%s' cannot contain code or data (not ROM0 or ROMX)",
-			   pCurrentSection->pzName);
-	} else if (nUnionDepth > 0) {
-		fatalerror("UNIONs cannot contain code or data");
-	}
-}
-
-/*
- * Check if the section has grown too much.
- */
-static void checksectionoverflow(uint32_t delta_size)
-{
-	uint32_t maxsize = getmaxsectionsize(pCurrentSection->nType,
-					  pCurrentSection->pzName);
-
-	if (pCurrentSection->nPC + delta_size > maxsize) {
-		/*
-		 * This check is here to trap broken code that generates
-		 * sections that are too big and to prevent the assembler from
-		 * generating huge object files or trying to allocate too much
-		 * memory.
-		 * The real check must be done at the linking stage.
-		 */
-		fatalerror("Section '%s' is too big (max size = 0x%X bytes).",
-			   pCurrentSection->pzName, maxsize);
-	}
+	pPatch->pRPN = rpnexpr;
+	pPatch->nRPNSize = rpnptr;
 }
 
 /*
@@ -527,22 +416,17 @@ static void checksectionoverflow(uint32_t delta_size)
 void out_WriteObject(void)
 {
 	FILE *f;
-
-	addexports();
-
-	/* If no path specified, don't write file */
-	if (tzObjectname == NULL)
-		return;
-
-	f = fopen(tzObjectname, "wb");
-	if (f == NULL)
-		fatalerror("Couldn't write file '%s'\n", tzObjectname);
-
 	struct PatchSymbol *pSym;
 	struct Section *pSect;
 
-	fwrite(RGBDS_OBJECT_VERSION_STRING, 1,
-	       strlen(RGBDS_OBJECT_VERSION_STRING), f);
+	addexports();
+
+	f = fopen(tzObjectname, "wb");
+	if (!f)
+		err(1, "Couldn't write file '%s'", tzObjectname);
+
+	fprintf(f, RGBDS_OBJECT_VERSION_STRING, RGBDS_OBJECT_VERSION_NUMBER);
+	fputlong(RGBDS_OBJECT_REV, f);
 
 	fputlong(countsymbols(), f);
 	fputlong(countsections(), f);
@@ -563,22 +447,6 @@ void out_WriteObject(void)
 }
 
 /*
- * Prepare for pass #2
- */
-void out_PrepPass2(void)
-{
-	struct Section *pSect;
-
-	pSect = pSectionList;
-	while (pSect) {
-		pSect->nPC = 0;
-		pSect = pSect->pNext;
-	}
-	pCurrentSection = NULL;
-	pSectionStack = NULL;
-}
-
-/*
  * Set the objectfilename
  */
 void out_SetFileName(char *s)
@@ -586,388 +454,4 @@ void out_SetFileName(char *s)
 	tzObjectname = s;
 	if (CurrentOptions.verbose)
 		printf("Output filename %s\n", s);
-
-	pSectionList = NULL;
-	pCurrentSection = NULL;
-	pPatchSymbols = NULL;
-}
-
-/*
- * Find a section by name and type. If it doesn't exist, create it
- */
-struct Section *out_FindSection(char *pzName, uint32_t secttype, int32_t org,
-				int32_t bank, int32_t alignment)
-{
-	struct Section *pSect, **ppSect;
-
-	ppSect = &pSectionList;
-	pSect = pSectionList;
-
-	while (pSect) {
-		if (strcmp(pzName, pSect->pzName) == 0) {
-			if (secttype == pSect->nType
-			    && ((uint32_t)org) == pSect->nOrg
-			    && ((uint32_t)bank) == pSect->nBank
-			    && ((uint32_t)alignment == pSect->nAlign)) {
-				return pSect;
-			}
-
-			fatalerror("Section already exists but with a different type");
-		}
-		ppSect = &(pSect->pNext);
-		pSect = pSect->pNext;
-	}
-
-	pSect = malloc(sizeof(struct Section));
-	*ppSect = pSect;
-	if (pSect == NULL)
-		fatalerror("Not enough memory for section");
-
-	pSect->pzName = malloc(strlen(pzName) + 1);
-	if (pSect->pzName == NULL)
-		fatalerror("Not enough memory for sectionname");
-
-	strcpy(pSect->pzName, pzName);
-	pSect->nType = secttype;
-	pSect->nPC = 0;
-	pSect->nOrg = org;
-	pSect->nBank = bank;
-	pSect->nAlign = alignment;
-	pSect->pNext = NULL;
-	pSect->pPatches = NULL;
-	pSect->charmap = NULL;
-	pPatchSymbols = NULL;
-
-	/* It is only needed to allocate memory for ROM sections. */
-	if (secttype == SECT_ROM0 || secttype == SECT_ROMX) {
-		uint32_t sectsize;
-
-		sectsize = getmaxsectionsize(secttype, pzName);
-		pSect->tData = malloc(sectsize);
-		if (pSect->tData == NULL)
-			fatalerror("Not enough memory for section");
-	} else {
-		pSect->tData = NULL;
-	}
-
-	return (pSect);
-}
-
-/*
- * Set the current section
- */
-void out_SetCurrentSection(struct Section *pSect)
-{
-	if (nUnionDepth > 0)
-		fatalerror("Cannot change the section within a UNION");
-
-	pCurrentSection = pSect;
-	nPC = pSect->nPC;
-
-	pPCSymbol->nValue = nPC;
-	pPCSymbol->pSection = pCurrentSection;
-}
-
-/*
- * Set the current section by name and type
- */
-void out_NewSection(char *pzName, uint32_t secttype)
-{
-	out_SetCurrentSection(out_FindSection(pzName, secttype, -1, -1, 1));
-}
-
-/*
- * Set the current section by name and type
- */
-void out_NewAbsSection(char *pzName, uint32_t secttype, int32_t org,
-		       int32_t bank)
-{
-	out_SetCurrentSection(out_FindSection(pzName, secttype, org, bank, 1));
-}
-
-/*
- * Set the current section by name and type, using a given byte alignment
- */
-void out_NewAlignedSection(char *pzName, uint32_t secttype, int32_t alignment,
-			   int32_t bank)
-{
-	if (alignment < 0 || alignment > 16)
-		yyerror("Alignment must be between 0-16 bits.");
-
-	out_SetCurrentSection(out_FindSection(pzName, secttype, -1, bank,
-					      1 << alignment));
-}
-
-/*
- * Output an absolute byte (bypassing ROM/union checks)
- */
-void out_AbsByteBypassCheck(int32_t b)
-{
-	checksectionoverflow(1);
-	b &= 0xFF;
-	if (nPass == 2)
-		pCurrentSection->tData[nPC] = b;
-
-	pCurrentSection->nPC += 1;
-	nPC += 1;
-	pPCSymbol->nValue += 1;
-}
-
-/*
- * Output an absolute byte
- */
-void out_AbsByte(int32_t b)
-{
-	checkcodesection();
-	out_AbsByteBypassCheck(b);
-}
-
-void out_AbsByteGroup(char *s, int32_t length)
-{
-	checkcodesection();
-	checksectionoverflow(length);
-	while (length--)
-		out_AbsByte(*s++);
-}
-
-/*
- * Skip this many bytes
- */
-void out_Skip(int32_t skip)
-{
-	checksection();
-	checksectionoverflow(skip);
-	if (!((pCurrentSection->nType == SECT_ROM0)
-		|| (pCurrentSection->nType == SECT_ROMX))) {
-		pCurrentSection->nPC += skip;
-		nPC += skip;
-		pPCSymbol->nValue += skip;
-	} else if (nUnionDepth > 0) {
-		while (skip--)
-			out_AbsByteBypassCheck(CurrentOptions.fillchar);
-	} else {
-		checkcodesection();
-		while (skip--)
-			out_AbsByte(CurrentOptions.fillchar);
-	}
-}
-
-/*
- * Output a NULL terminated string (excluding the NULL-character)
- */
-void out_String(char *s)
-{
-	checkcodesection();
-	checksectionoverflow(strlen(s));
-	while (*s)
-		out_AbsByte(*s++);
-}
-
-/*
- * Output a relocatable byte. Checking will be done to see if it
- * is an absolute value in disguise.
- */
-void out_RelByte(struct Expression *expr)
-{
-	checkcodesection();
-	checksectionoverflow(1);
-	if (rpn_isReloc(expr)) {
-		if (nPass == 2) {
-			pCurrentSection->tData[nPC] = 0;
-			createpatch(PATCH_BYTE, expr);
-		}
-		pCurrentSection->nPC += 1;
-		nPC += 1;
-		pPCSymbol->nValue += 1;
-	} else {
-		out_AbsByte(expr->nVal);
-	}
-	rpn_Free(expr);
-}
-
-/*
- * Output an absolute word
- */
-void out_AbsWord(int32_t b)
-{
-	checkcodesection();
-	checksectionoverflow(2);
-	b &= 0xFFFF;
-	if (nPass == 2) {
-		pCurrentSection->tData[nPC] = b & 0xFF;
-		pCurrentSection->tData[nPC + 1] = b >> 8;
-	}
-	pCurrentSection->nPC += 2;
-	nPC += 2;
-	pPCSymbol->nValue += 2;
-}
-
-/*
- * Output a relocatable word. Checking will be done to see if
- * it's an absolute value in disguise.
- */
-void out_RelWord(struct Expression *expr)
-{
-	uint32_t b;
-
-	checkcodesection();
-	checksectionoverflow(2);
-	b = expr->nVal & 0xFFFF;
-	if (rpn_isReloc(expr)) {
-		if (nPass == 2) {
-			pCurrentSection->tData[nPC] = b & 0xFF;
-			pCurrentSection->tData[nPC + 1] = b >> 8;
-			createpatch(PATCH_WORD_L, expr);
-		}
-		pCurrentSection->nPC += 2;
-		nPC += 2;
-		pPCSymbol->nValue += 2;
-	} else {
-		out_AbsWord(expr->nVal);
-	}
-	rpn_Free(expr);
-}
-
-/*
- * Output an absolute longword
- */
-void out_AbsLong(int32_t b)
-{
-	checkcodesection();
-	checksectionoverflow(sizeof(int32_t));
-	if (nPass == 2) {
-		pCurrentSection->tData[nPC] = b & 0xFF;
-		pCurrentSection->tData[nPC + 1] = b >> 8;
-		pCurrentSection->tData[nPC + 2] = b >> 16;
-		pCurrentSection->tData[nPC + 3] = b >> 24;
-	}
-	pCurrentSection->nPC += 4;
-	nPC += 4;
-	pPCSymbol->nValue += 4;
-}
-
-/*
- * Output a relocatable longword. Checking will be done to see if
- * is an absolute value in disguise.
- */
-void out_RelLong(struct Expression *expr)
-{
-	int32_t b;
-
-	checkcodesection();
-	checksectionoverflow(4);
-	b = expr->nVal;
-	if (rpn_isReloc(expr)) {
-		if (nPass == 2) {
-			pCurrentSection->tData[nPC] = b & 0xFF;
-			pCurrentSection->tData[nPC + 1] = b >> 8;
-			pCurrentSection->tData[nPC + 2] = b >> 16;
-			pCurrentSection->tData[nPC + 3] = b >> 24;
-			createpatch(PATCH_LONG_L, expr);
-		}
-		pCurrentSection->nPC += 4;
-		nPC += 4;
-		pPCSymbol->nValue += 4;
-	} else {
-		out_AbsLong(expr->nVal);
-	}
-	rpn_Free(expr);
-}
-
-/*
- * Output a PC-relative relocatable byte. Checking will be done to see if it
- * is an absolute value in disguise.
- */
-void out_PCRelByte(struct Expression *expr)
-{
-	checkcodesection();
-	checksectionoverflow(1);
-
-	/* Always let the linker calculate the offset. */
-	if (nPass == 2) {
-		pCurrentSection->tData[nPC] = 0;
-		createpatch(PATCH_BYTE_JR, expr);
-	}
-	pCurrentSection->nPC += 1;
-	nPC += 1;
-	pPCSymbol->nValue += 1;
-
-	rpn_Free(expr);
-}
-
-/*
- * Output a binary file
- */
-void out_BinaryFile(char *s)
-{
-	FILE *f;
-
-	f = fstk_FindFile(s, NULL);
-	if (f == NULL)
-		err(1, "Unable to open incbin file '%s'", s);
-
-	int32_t fsize;
-
-	fseek(f, 0, SEEK_END);
-	fsize = ftell(f);
-	fseek(f, 0, SEEK_SET);
-
-	checkcodesection();
-	checksectionoverflow(fsize);
-
-	if (nPass == 2) {
-		int32_t dest = nPC;
-		int32_t todo = fsize;
-
-		while (todo--)
-			pCurrentSection->tData[dest++] = fgetc(f);
-	}
-	pCurrentSection->nPC += fsize;
-	nPC += fsize;
-	pPCSymbol->nValue += fsize;
-	fclose(f);
-}
-
-void out_BinaryFileSlice(char *s, int32_t start_pos, int32_t length)
-{
-	FILE *f;
-
-	if (start_pos < 0)
-		fatalerror("Start position cannot be negative");
-
-	if (length < 0)
-		fatalerror("Number of bytes to read must be greater than zero");
-
-	f = fstk_FindFile(s, NULL);
-	if (f == NULL)
-		err(1, "Unable to open included file '%s'", s);
-
-	int32_t fsize;
-
-	fseek(f, 0, SEEK_END);
-	fsize = ftell(f);
-
-	if (start_pos >= fsize)
-		fatalerror("Specified start position is greater than length of file");
-
-	if ((start_pos + length) > fsize)
-		fatalerror("Specified range in INCBIN is out of bounds");
-
-	fseek(f, start_pos, SEEK_SET);
-
-	checkcodesection();
-	checksectionoverflow(length);
-
-	if (nPass == 2) {
-		int32_t dest = nPC;
-		int32_t todo = length;
-
-		while (todo--)
-			pCurrentSection->tData[dest++] = fgetc(f);
-	}
-	pCurrentSection->nPC += length;
-	nPC += length;
-	pPCSymbol->nValue += length;
-
-	fclose(f);
 }

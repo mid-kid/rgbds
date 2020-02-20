@@ -1,7 +1,7 @@
 /*
  * This file is part of RGBDS.
  *
- * Copyright (c) 1997-2018, Carsten Sorensen and RGBDS contributors.
+ * Copyright (c) 1997-2019, Carsten Sorensen and RGBDS contributors.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -15,11 +15,12 @@
 #include <ctype.h>
 
 #include "asm/asm.h"
-#include "asm/constexpr.h"
 #include "asm/fstack.h"
 #include "asm/lexer.h"
 #include "asm/main.h"
 #include "asm/rpn.h"
+#include "asm/section.h"
+#include "asm/warning.h"
 
 #include "extern/err.h"
 
@@ -38,6 +39,8 @@ struct sLexString {
 
 #define SAFETYMARGIN		1024
 
+#define BOM_SIZE 3
+
 struct sLexFloat tLexFloat[32];
 struct sLexString *tLexHash[LEXHASHSIZE];
 YY_BUFFER_STATE pCurrentBuffer;
@@ -49,11 +52,17 @@ uint32_t tFloatingChars[256];
 uint32_t nFloating;
 enum eLexerState lexerstate = LEX_STATE_NORMAL;
 
+struct sStringExpansionPos *pCurrentStringExpansion;
+static unsigned int nNbStringExpansions;
+
+/* UTF-8 byte order mark */
+static const unsigned char bom[BOM_SIZE] = { 0xEF, 0xBB, 0xBF };
+
 void upperstring(char *s)
 {
 	while (*s) {
 		*s = toupper(*s);
-		s += 1;
+		s++;
 	}
 }
 
@@ -61,7 +70,7 @@ void lowerstring(char *s)
 {
 	while (*s) {
 		*s = tolower(*s);
-		s += 1;
+		s++;
 	}
 }
 
@@ -83,17 +92,49 @@ void yyunput(char c)
 	*(--pLexBuffer) = c;
 }
 
-void yyunputstr(char *s)
+void yyunputstr(const char *s)
 {
-	int32_t i, len;
+	int32_t len;
 
 	len = strlen(s);
 
-	if (pLexBuffer - len < pLexBufferRealStart)
+	/*
+	 * It would be undefined behavior to subtract `len` from pLexBuffer and
+	 * potentially have it point outside of pLexBufferRealStart's buffer,
+	 * this is why the check is done this way.
+	 * Refer to https://github.com/rednex/rgbds/pull/411#discussion_r319779797
+	 */
+	if (pLexBuffer - pLexBufferRealStart < len)
 		fatalerror("Buffer safety margin exceeded");
 
-	for (i = len - 1; i >= 0; i--)
-		*(--pLexBuffer) = s[i];
+	pLexBuffer -= len;
+
+	memcpy(pLexBuffer, s, len);
+}
+
+/*
+ * Marks that a new string expansion with name `tzName` ends here
+ * Enforces recursion depth
+ */
+void lex_BeginStringExpansion(const char *tzName)
+{
+	if (++nNbStringExpansions > nMaxRecursionDepth)
+		fatalerror("Recursion limit (%d) exceeded", nMaxRecursionDepth);
+
+	struct sStringExpansionPos *pNewStringExpansion =
+		malloc(sizeof(*pNewStringExpansion));
+	char *tzNewExpansionName = strdup(tzName);
+
+	if (!pNewStringExpansion || !tzNewExpansionName)
+		fatalerror("Could not allocate memory to expand '%s'",
+			   tzName);
+
+	pNewStringExpansion->tzName = tzNewExpansionName;
+	pNewStringExpansion->pBuffer = pLexBufferRealStart;
+	pNewStringExpansion->pBufferPos = pLexBuffer;
+	pNewStringExpansion->pParent = pCurrentStringExpansion;
+
+	pCurrentStringExpansion = pNewStringExpansion;
 }
 
 void yy_switch_to_buffer(YY_BUFFER_STATE buf)
@@ -118,13 +159,34 @@ void yy_delete_buffer(YY_BUFFER_STATE buf)
  * 2. The buffer is terminated with 0
  * 3. nBufferSize is the size without the terminator
  */
-static void yy_buffer_append(YY_BUFFER_STATE buf, uint32_t capacity, char c)
+static void yy_buffer_append(YY_BUFFER_STATE buf, size_t capacity, char c)
 {
-	assert(buf->pBuffer[buf->nBufferSize] == 0);
+	assert(buf->pBufferStart[buf->nBufferSize] == 0);
 	assert(buf->nBufferSize + 1 < capacity);
 
-	buf->pBuffer[buf->nBufferSize++] = c;
-	buf->pBuffer[buf->nBufferSize] = 0;
+	buf->pBufferStart[buf->nBufferSize++] = c;
+	buf->pBufferStart[buf->nBufferSize] = 0;
+}
+
+static void yy_buffer_append_newlines(YY_BUFFER_STATE buf, size_t capacity)
+{
+	/* Add newline if file doesn't end with one */
+	if (buf->nBufferSize == 0
+	 || buf->pBufferStart[buf->nBufferSize - 1] != '\n')
+		yy_buffer_append(buf, capacity, '\n');
+
+	/* Add newline if \ will eat the last newline */
+	if (buf->nBufferSize >= 2) {
+		size_t pos = buf->nBufferSize - 2;
+
+		/* Skip spaces and tabs */
+		while (pos > 0 && (buf->pBufferStart[pos] == ' '
+				|| buf->pBufferStart[pos] == '\t'))
+			pos--;
+
+		if (buf->pBufferStart[pos] == '\\')
+			yy_buffer_append(buf, capacity, '\n');
+	}
 }
 
 YY_BUFFER_STATE yy_scan_bytes(char *mem, uint32_t size)
@@ -134,7 +196,9 @@ YY_BUFFER_STATE yy_scan_bytes(char *mem, uint32_t size)
 	if (pBuffer == NULL)
 		fatalerror("%s: Out of memory!", __func__);
 
-	pBuffer->pBufferRealStart = malloc(size + 1 + SAFETYMARGIN);
+	size_t capacity = size + 3; /* space for 2 newlines and terminator */
+
+	pBuffer->pBufferRealStart = malloc(capacity + SAFETYMARGIN);
 
 	if (pBuffer->pBufferRealStart == NULL)
 		fatalerror("%s: Out of memory for buffer!", __func__);
@@ -142,9 +206,10 @@ YY_BUFFER_STATE yy_scan_bytes(char *mem, uint32_t size)
 	pBuffer->pBufferStart = pBuffer->pBufferRealStart + SAFETYMARGIN;
 	pBuffer->pBuffer = pBuffer->pBufferRealStart + SAFETYMARGIN;
 	memcpy(pBuffer->pBuffer, mem, size);
-	pBuffer->nBufferSize = size;
-	pBuffer->oAtLineStart = 1;
 	pBuffer->pBuffer[size] = 0;
+	pBuffer->nBufferSize = size;
+	yy_buffer_append_newlines(pBuffer, capacity);
+	pBuffer->oAtLineStart = 1;
 
 	return pBuffer;
 }
@@ -156,71 +221,119 @@ YY_BUFFER_STATE yy_create_buffer(FILE *f)
 	if (pBuffer == NULL)
 		fatalerror("%s: Out of memory!", __func__);
 
-	uint32_t size;
+	size_t size = 0, capacity = -1;
+	char *buf = NULL;
 
-	fseek(f, 0, SEEK_END);
-	size = ftell(f);
-	fseek(f, 0, SEEK_SET);
+	/*
+	 * Check if we can get the file size without implementation-defined
+	 * behavior:
+	 *
+	 * From ftell(3p):
+	 * [On error], ftell() and ftello() shall return −1, and set errno to
+	 * indicate the error.
+	 *
+	 * The ftell() and ftello() functions shall fail if: [...]
+	 * ESPIPE The file descriptor underlying stream is associated with a
+	 * pipe, FIFO, or socket.
+	 *
+	 * From fseek(3p):
+	 * The behavior of fseek() on devices which are incapable of seeking
+	 * is implementation-defined.
+	 */
+	if (ftell(f) != -1) {
+		fseek(f, 0, SEEK_END);
+		capacity = ftell(f);
+		rewind(f);
+	}
 
-	/* Give extra room for 2 newlines and terminator */
-	uint32_t capacity = size + 3;
+	// If ftell errored or the block above wasn't executed
+	if (capacity == -1)
+		capacity = 4096;
+	// Handle 0-byte files gracefully
+	else if (capacity == 0)
+		capacity = 1;
 
-	pBuffer->pBufferRealStart = malloc(capacity + SAFETYMARGIN);
+	while (!feof(f)) {
+		if (buf == NULL || size >= capacity) {
+			if (buf)
+				capacity *= 2;
+			/* Give extra room for 2 newlines and terminator */
+			buf = realloc(buf, capacity + SAFETYMARGIN + 3);
 
-	if (pBuffer->pBufferRealStart == NULL)
-		fatalerror("%s: Out of memory for buffer!", __func__);
+			if (buf == NULL)
+				fatalerror("%s: Out of memory for buffer!",
+					   __func__);
+		}
 
-	pBuffer->pBufferStart = pBuffer->pBufferRealStart + SAFETYMARGIN;
-	pBuffer->pBuffer = pBuffer->pBufferRealStart + SAFETYMARGIN;
+		char *bufpos = buf + SAFETYMARGIN + size;
+		size_t read_count = fread(bufpos, 1, capacity - size, f);
 
-	size = fread(pBuffer->pBuffer, sizeof(uint8_t), size, f);
+		if (read_count == 0 && !feof(f))
+			fatalerror("%s: fread error", __func__);
 
+		size += read_count;
+	}
+
+	pBuffer->pBufferRealStart = buf;
+	pBuffer->pBufferStart = buf + SAFETYMARGIN;
+	pBuffer->pBuffer = buf + SAFETYMARGIN;
 	pBuffer->pBuffer[size] = 0;
 	pBuffer->nBufferSize = size;
+
+	/* This is added here to make the buffer scaling above easy to express,
+	 * while taking the newline space into account
+	 * for the yy_buffer_append_newlines() call below.
+	 */
+	capacity += 3;
+
+	/* Skip UTF-8 byte order mark. */
+	if (pBuffer->nBufferSize >= BOM_SIZE
+	 && !memcmp(pBuffer->pBuffer, bom, BOM_SIZE))
+		pBuffer->pBuffer += BOM_SIZE;
 
 	/* Convert all line endings to LF and spaces */
 
 	char *mem = pBuffer->pBuffer;
-	uint32_t instring = 0;
+	int32_t lineCount = 0;
 
 	while (*mem) {
-		if (*mem == '\"')
-			instring = 1 - instring;
-
 		if ((mem[0] == '\\') && (mem[1] == '\"' || mem[1] == '\\')) {
 			mem += 2;
-		} else if (instring) {
-			mem += 1;
 		} else {
 			/* LF CR and CR LF */
-			if (((mem[0] == 10) && (mem[1] == 13))
-			 || ((mem[0] == 13) && (mem[1] == 10))) {
-				mem[0] = ' ';
-				mem[1] = '\n';
-				mem += 2;
+			if (((mem[0] == '\n') && (mem[1] == '\r'))
+			 || ((mem[0] == '\r') && (mem[1] == '\n'))) {
+				*mem++ = ' ';
+				*mem++ = '\n';
+				lineCount++;
 			/* LF and CR */
-			} else if ((mem[0] == 10) || (mem[0] == 13)) {
-				mem[0] = '\n';
-				mem += 1;
+			} else if ((mem[0] == '\n') || (mem[0] == '\r')) {
+				*mem++ = '\n';
+				lineCount++;
 			} else {
-				mem += 1;
+				mem++;
 			}
 		}
+	}
+
+	if (mem != pBuffer->pBuffer + size) {
+		nLineNo = lineCount + 1;
+		fatalerror("Found null character");
 	}
 
 	/* Remove comments */
 
 	mem = pBuffer->pBuffer;
-	instring = 0;
+	bool instring = false;
 
 	while (*mem) {
 		if (*mem == '\"')
-			instring = 1 - instring;
+			instring = !instring;
 
 		if ((mem[0] == '\\') && (mem[1] == '\"' || mem[1] == '\\')) {
 			mem += 2;
 		} else if (instring) {
-			mem += 1;
+			mem++;
 		} else {
 			/* Comments that start with ; anywhere in a line */
 			if (*mem == ';') {
@@ -228,31 +341,16 @@ YY_BUFFER_STATE yy_create_buffer(FILE *f)
 					*mem++ = ' ';
 			/* Comments that start with * at the start of a line */
 			} else if ((mem[0] == '\n') && (mem[1] == '*')) {
-				mem += 1;
+				mem++;
 				while (!((*mem == '\n') || (*mem == '\0')))
 					*mem++ = ' ';
 			} else {
-				mem += 1;
+				mem++;
 			}
 		}
 	}
 
-	/* Add newline if file doesn't end with one */
-	if (size == 0 || pBuffer->pBuffer[size - 1] != '\n')
-		yy_buffer_append(pBuffer, capacity, '\n');
-
-	/* Add newline if \ will eat the last newline */
-	if (pBuffer->nBufferSize >= 2) {
-		size_t pos = pBuffer->nBufferSize - 2;
-
-		/* Skip spaces */
-		while (pos > 0 && pBuffer->pBuffer[pos] == ' ')
-			pos--;
-
-		if (pBuffer->pBuffer[pos] == '\\')
-			yy_buffer_append(pBuffer, capacity, '\n');
-	}
-
+	yy_buffer_append_newlines(pBuffer, capacity);
 	pBuffer->oAtLineStart = 1;
 	return pBuffer;
 }
@@ -268,71 +366,73 @@ uint32_t lex_FloatAlloc(const struct sLexFloat *token)
  * Make sure that only non-zero ASCII characters are used. Also, check if the
  * start is greater than the end of the range.
  */
-void lex_CheckCharacterRange(uint16_t start, uint16_t end)
+bool lex_CheckCharacterRange(uint16_t start, uint16_t end)
 {
 	if (start > end || start < 1 || end > 127) {
-		errx(1, "Invalid character range (start: %u, end: %u)",
-		     start, end);
+		yyerror("Invalid character range (start: %u, end: %u)",
+			start, end);
+		return false;
 	}
+	return true;
 }
 
 void lex_FloatDeleteRange(uint32_t id, uint16_t start, uint16_t end)
 {
-	lex_CheckCharacterRange(start, end);
-
-	while (start <= end) {
-		tFloatingChars[start] &= ~id;
-		start += 1;
+	if (lex_CheckCharacterRange(start, end)) {
+		while (start <= end) {
+			tFloatingChars[start] &= ~id;
+			start++;
+		}
 	}
 }
 
 void lex_FloatAddRange(uint32_t id, uint16_t start, uint16_t end)
 {
-	lex_CheckCharacterRange(start, end);
-
-	while (start <= end) {
-		tFloatingChars[start] |= id;
-		start += 1;
+	if (lex_CheckCharacterRange(start, end)) {
+		while (start <= end) {
+			tFloatingChars[start] |= id;
+			start++;
+		}
 	}
 }
 
 void lex_FloatDeleteFirstRange(uint32_t id, uint16_t start, uint16_t end)
 {
-	lex_CheckCharacterRange(start, end);
-
-	while (start <= end) {
-		tFloatingFirstChar[start] &= ~id;
-		start += 1;
+	if (lex_CheckCharacterRange(start, end)) {
+		while (start <= end) {
+			tFloatingFirstChar[start] &= ~id;
+			start++;
+		}
 	}
 }
 
 void lex_FloatAddFirstRange(uint32_t id, uint16_t start, uint16_t end)
 {
-	lex_CheckCharacterRange(start, end);
-
-	while (start <= end) {
-		tFloatingFirstChar[start] |= id;
-		start += 1;
+	if (lex_CheckCharacterRange(start, end)) {
+		while (start <= end) {
+			tFloatingFirstChar[start] |= id;
+			start++;
+		}
 	}
 }
 
 void lex_FloatDeleteSecondRange(uint32_t id, uint16_t start, uint16_t end)
 {
-	lex_CheckCharacterRange(start, end);
-
-	while (start <= end) {
-		tFloatingSecondChar[start] &= ~id;
-		start += 1;
+	if (lex_CheckCharacterRange(start, end)) {
+		while (start <= end) {
+			tFloatingSecondChar[start] &= ~id;
+			start++;
+		}
 	}
 }
 
 void lex_FloatAddSecondRange(uint32_t id, uint16_t start, uint16_t end)
 {
-	lex_CheckCharacterRange(start, end);
-
-	while (start <= end) {
-		tFloatingSecondChar[start] |= id;
-		start += 1;
+	if (lex_CheckCharacterRange(start, end)) {
+		while (start <= end) {
+			tFloatingSecondChar[start] |= id;
+			start++;
+		}
 	}
 }
 
@@ -376,6 +476,9 @@ void lex_Init(void)
 
 	nLexMaxLength = 0;
 	nFloating = 0;
+
+	pCurrentStringExpansion = NULL;
+	nNbStringExpansions = 0;
 }
 
 void lex_AddStrings(const struct sLexInitString *lex)
@@ -405,7 +508,7 @@ void lex_AddStrings(const struct sLexInitString *lex)
 		if ((*ppHash)->nNameLength > nLexMaxLength)
 			nLexMaxLength = (*ppHash)->nNameLength;
 
-		lex += 1;
+		lex++;
 	}
 }
 
@@ -428,17 +531,17 @@ void yylex_GetFloatMaskAndFloatLen(uint32_t *pnFloatMask, uint32_t *pnFloatLen)
 
 	char *s = pLexBuffer;
 	uint32_t nOldFloatMask = 0;
-	uint32_t nFloatMask = tFloatingFirstChar[(int32_t)*s];
+	uint32_t nFloatMask = tFloatingFirstChar[(uint8_t)*s];
 
 	if (nFloatMask != 0) {
 		s++;
 		nOldFloatMask = nFloatMask;
-		nFloatMask &= tFloatingSecondChar[(int32_t)*s];
+		nFloatMask &= tFloatingSecondChar[(uint8_t)*s];
 
 		while (nFloatMask != 0) {
 			s++;
 			nOldFloatMask = nFloatMask;
-			nFloatMask &= tFloatingChars[(int32_t)*s];
+			nFloatMask &= tFloatingChars[(uint8_t)*s];
 		}
 	}
 
@@ -552,6 +655,7 @@ size_t yylex_ReadBracketedSymbol(char *dest, size_t index)
 	char ch;
 	size_t i = 0;
 	size_t length, maxLength;
+	const char *mode = NULL;
 
 	for (ch = *pLexBuffer;
 	     ch != '}' && ch != '"' && ch != '\n';
@@ -565,16 +669,47 @@ size_t yylex_ReadBracketedSymbol(char *dest, size_t index)
 				i += length;
 			else
 				fatalerror("Illegal character escape '%c'", ch);
+		} else if (ch == '{') {
+			/* Handle nested symbols */
+			++pLexBuffer;
+			i += yylex_ReadBracketedSymbol(sym, i);
+			--pLexBuffer;
+		} else if (ch == ':' && !mode) { /* Only grab 1st colon */
+			/* Use a whitelist of modes, which does prevent the
+			 * use of some features such as precision,
+			 * but also avoids a security flaw
+			 */
+			const char *acceptedModes = "bxXd";
+			/* Binary isn't natively supported,
+			 * so it's handled differently
+			 */
+			static const char * const formatSpecifiers[] = {
+				"", "%x", "%X", "%d"
+			};
+			/* Prevent reading out of bounds! */
+			const char *designatedMode;
+
+			if (i != 1)
+				fatalerror("Print types are exactly 1 character long");
+
+			designatedMode = strchr(acceptedModes, sym[i - 1]);
+			if (!designatedMode)
+				fatalerror("Illegal print type '%c'",
+					   sym[i - 1]);
+			mode = formatSpecifiers[designatedMode - acceptedModes];
+			/* Begin writing the symbol again */
+			i = 0;
 		} else {
 			yylex_SymbolWriteChar(sym, i++, ch);
 		}
 	}
 
+	/* Properly terminate the string */
 	yylex_SymbolWriteChar(sym, i, 0);
 
 	/* It's assumed we're writing to a T_STRING */
 	maxLength = MAXSTRLEN - index;
-	length = symvaluetostring(&dest[index], maxLength, sym);
+	length = symvaluetostring(&dest[index], maxLength, sym, mode);
 
 	if (*pLexBuffer == '}')
 		pLexBuffer++;
@@ -598,6 +733,9 @@ static void yylex_ReadQuotedString(void)
 			switch (ch) {
 			case 'n':
 				ch = '\n';
+				break;
+			case 'r':
+				ch = '\r';
 				break;
 			case 't':
 				ch = '\t';
@@ -681,17 +819,18 @@ scanagain:
 		 * endings: "\r\n" is replaced by " \n" before the lexer has the
 		 * opportunity to see it.
 		 */
-		if (pLexBuffer[1] == ' ') {
+		if (pLexBuffer[1] == ' ' || pLexBuffer[1] == '\t') {
 			pLexBuffer += 2;
 			while (1) {
-				if (*pLexBuffer == ' ') {
+				if (*pLexBuffer == ' ' || *pLexBuffer == '\t') {
 					pLexBuffer++;
 				} else if (*pLexBuffer == '\n') {
 					pLexBuffer++;
-					nLineNo += 1;
+					nLineNo++;
 					goto scanagain;
 				} else {
-					errx(1, "Expected a new line after the continuation character.");
+					yyerror("Expected a new line after the continuation character.");
+					pLexBuffer++;
 				}
 			}
 		}
@@ -699,7 +838,7 @@ scanagain:
 		/* Line continuation character */
 		if (pLexBuffer[1] == '\n') {
 			pLexBuffer += 2;
-			nLineNo += 1;
+			nLineNo++;
 			goto scanagain;
 		}
 
@@ -731,7 +870,9 @@ scanagain:
 			return T_STRING;
 		} else if (*pLexBuffer == '{') {
 			pLexBuffer++;
-			yylex_ReadBracketedSymbol(yylval.tzString, 0);
+			size_t len = yylex_ReadBracketedSymbol(yylval.tzString,
+							       0);
+			yylval.tzString[len] = 0;
 			return T_STRING;
 		}
 
@@ -740,10 +881,22 @@ scanagain:
 		 * numeric literal, string, or bracketed symbol, so just return
 		 * the ASCII character.
 		 */
-		if (*pLexBuffer == '\n')
+		unsigned char ch = *pLexBuffer++;
+
+		if (ch == '\n')
 			AtLineStart = 1;
 
-		return *pLexBuffer++;
+		/*
+		 * Check for invalid unprintable characters.
+		 * They may not be readily apparent in a text editor,
+		 * so this is useful for identifying encoding problems.
+		 */
+		if (ch != 0
+		 && ch != '\n'
+		 && !(ch >= 0x20 && ch <= 0x7E))
+			fatalerror("Found garbage character: 0x%02X", ch);
+
+		return ch;
 	}
 
 	if (pLongestFixed == NULL || nFloatLen > pLongestFixed->nNameLength) {
@@ -759,8 +912,6 @@ scanagain:
 			if (!done)
 				goto scanagain;
 		}
-
-		pLexBuffer += nFloatLen;
 
 		if (token->nToken == T_ID && linestart)
 			return T_LABEL;
@@ -811,6 +962,7 @@ static uint32_t yylex_MACROARGS(void)
 				ch = '}';
 				break;
 			case ' ':
+			case '\t':
 				/*
 				 * Look for line continuation character after a
 				 * series of spaces. This is also useful for
@@ -819,21 +971,22 @@ static uint32_t yylex_MACROARGS(void)
 				 * opportunity to see it.
 				 */
 				while (1) {
-					if (*pLexBuffer == ' ') {
+					if (*pLexBuffer == ' '
+					 || *pLexBuffer == '\t') {
 						pLexBuffer++;
 					} else if (*pLexBuffer == '\n') {
 						pLexBuffer++;
-						nLineNo += 1;
+						nLineNo++;
 						ch = 0;
 						break;
 					} else {
-						errx(1, "Expected a new line after the continuation character.");
+						yyerror("Expected a new line after the continuation character.");
 					}
 				}
 				break;
 			case '\n':
 				/* Line continuation character */
-				nLineNo += 1;
+				nLineNo++;
 				ch = 0;
 				break;
 			default:
@@ -881,12 +1034,31 @@ static uint32_t yylex_MACROARGS(void)
 
 int yylex(void)
 {
+	int returnedChar;
+
 	switch (lexerstate) {
 	case LEX_STATE_NORMAL:
-		return yylex_NORMAL();
+		returnedChar = yylex_NORMAL();
+		break;
 	case LEX_STATE_MACROARGS:
-		return yylex_MACROARGS();
+		returnedChar = yylex_MACROARGS();
+		break;
 	default:
 		fatalerror("%s: Internal error.", __func__);
 	}
+
+	/* Check if string expansions were fully read */
+	while (pCurrentStringExpansion
+	    && pCurrentStringExpansion->pBuffer == pLexBufferRealStart
+	    && pCurrentStringExpansion->pBufferPos <= pLexBuffer) {
+		struct sStringExpansionPos *pParent =
+			pCurrentStringExpansion->pParent;
+		free(pCurrentStringExpansion->tzName);
+		free(pCurrentStringExpansion);
+
+		pCurrentStringExpansion = pParent;
+		nNbStringExpansions--;
+	}
+
+	return returnedChar;
 }
